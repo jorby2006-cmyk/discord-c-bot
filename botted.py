@@ -1,18 +1,15 @@
 # botted.py — CS1 Daily MP + C++ Judge (Windows/MSYS2-friendly)
 #
-# Repo-safe + practical:
-# - No token is hardcoded here. It only reads DISCORD_TOKEN + channel IDs from env vars.
-# - If python-dotenv is installed, it’ll load a local .env for convenience (just don’t commit .env).
+# QoL + enforcement edition:
+# - Admin commands: !postnow, !reset_today, !status
+# - Student help: !rules / !format
+# - Anti-spam: per-user submit cooldown + code size limit
+# - Better WA feedback: first mismatch line + truncation
+# - Skill enforcement (heuristics) per problem family (toggle via ENFORCE_SKILLS)
+# - Attachment support: .cpp/.cc/.cxx and .txt containing C++ code blocks
 #
-# What it does:
-# - Posts one “Daily Machine Problem” every day at 9:00 AM (Philippines time).
-# - Students submit C++ via !submit; the bot compiles + runs hidden tests.
-#
-# A few quality-of-life details:
-# - Prevents overlapping compiles/runs (submission lock).
-# - Better compile error output (shows real compiler output).
-# - Windows-friendly timeout killing (taskkill /T /F for process trees).
-# - Doesn’t spam chat on unknown commands.
+# NOTE: This is still a heuristic checker. It enforces “use arrays / nested loops / recursion”
+# by scanning source text, not by AST parsing.
 
 from __future__ import annotations
 
@@ -26,6 +23,7 @@ import datetime
 import asyncio
 import tempfile
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -71,6 +69,18 @@ COMPILE_TIMEOUT_SEC = int(os.getenv("COMPILE_TIMEOUT_SEC", "12"))
 RUN_TIMEOUT_SEC = int(os.getenv("RUN_TIMEOUT_SEC", "2"))
 MAX_OUTPUT_BYTES = int(os.getenv("MAX_OUTPUT_BYTES", "64000"))
 
+# Code size limit (to avoid abuse)
+MAX_CODE_BYTES = int(os.getenv("MAX_CODE_BYTES", "100000"))  # ~100KB
+
+# Cooldown per user to avoid spam
+SUBMIT_COOLDOWN_SEC = int(os.getenv("SUBMIT_COOLDOWN_SEC", "15"))
+
+# Toggle skill enforcement quickly if you need to
+ENFORCE_SKILLS = os.getenv("ENFORCE_SKILLS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+
+# Admin roles list (comma-separated). If empty, fall back to "Root Admin".
+ADMIN_ROLES = [r.strip() for r in os.getenv("ADMIN_ROLES", "Root Admin").split(",") if r.strip()]
+
 # g++ command.
 # On Windows (MSYS2), set env var GPP to something like:
 #   C:\msys64\ucrt64\bin\g++.exe
@@ -81,6 +91,11 @@ IS_WINDOWS = (os.name == "nt")
 # Only allow one submission to compile/run at a time (no overlaps)
 SUBMIT_LOCK = asyncio.Lock()
 
+# In-memory QoL state (resets on restart)
+BOT_START_MONO = time.monotonic()
+USER_LAST_SUBMIT: Dict[int, float] = {}
+USER_LAST_COMPILE_ERR: Dict[int, str] = {}
+
 # =========================
 # DISCORD BOT SETUP
 # =========================
@@ -88,12 +103,28 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+def is_admin_member(member: discord.Member) -> bool:
+    # True if member has ANY role name in ADMIN_ROLES, or is guild admin.
+    try:
+        if member.guild_permissions.administrator:
+            return True
+        names = {r.name for r in member.roles}
+        return any(ar in names for ar in ADMIN_ROLES)
+    except Exception:
+        return False
+
+def next_post_time_ph(now: Optional[datetime.datetime] = None) -> datetime.datetime:
+    now = now or datetime.datetime.now(PH_TZ)
+    today = now.date()
+    candidate = datetime.datetime.combine(today, datetime.time(POST_TIME.hour, POST_TIME.minute, tzinfo=PH_TZ))
+    if now >= candidate:
+        candidate = candidate + datetime.timedelta(days=1)
+    return candidate
+
 # =========================
 # STATE HELPERS
 # =========================
 def load_state() -> dict:
-    # Keeps track of day_index + the exact problem used per date.
-    # If the file is missing/corrupt, fall back safely instead of crashing.
     if not os.path.exists(STATE_FILE):
         return {"day_index": 0, "last_posted_date": None, "problems_by_date": {}}
     try:
@@ -118,30 +149,21 @@ class TestCase:
     out: str
 
 def stable_seed_for_day(day_index: int, date_str: str) -> int:
-    # Same date + same day_index => same generated problem.
-    # This makes restarts “safe” (today’s MP won’t change if the bot restarts).
     h = hashlib.sha256(f"{day_index}|{date_str}|CS1JUDGE".encode("utf-8")).hexdigest()
     return int(h[:16], 16)
 
 def pick_family(day_index: int) -> str:
-    # Rotates problem families so the class gets variety.
     families = ["arrays_basic", "arrays_nested", "bool_checks", "functions", "patterns", "strings", "math_logic", "recursion", "stl_intro"]
     return families[day_index % len(families)]
 
 def normalize_output(s: str) -> str:
-    # Normalize line endings + trim trailing whitespace/blank lines for fair judging.
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     lines = [ln.rstrip() for ln in s.split("\n")]
     while lines and lines[-1] == "":
         lines.pop()
     return "\n".join(lines) + ("\n" if lines else "")
 
-def total_elements(family_kinds: dict) -> int:
-    return sum(len(elements) for elements in family_kinds.values())
-
-
 def generate_problem(day_index: int, date_str: str) -> dict:
-    # Central generator: picks the family, builds the problem, and stamps metadata.
     seed = stable_seed_for_day(day_index, date_str)
     rng = random.Random(seed)
 
@@ -162,7 +184,7 @@ def generate_problem(day_index: int, date_str: str) -> dict:
         p = gen_math_logic(rng)
     elif family == "recursion":
         p = gen_recursion(rng)
-    else: # stl_intro
+    else:  # stl_intro
         p = gen_stl_intro(rng)
 
     p["day"] = date_str
@@ -174,7 +196,6 @@ def generate_problem(day_index: int, date_str: str) -> dict:
 # EMBED BUILDER
 # =========================
 def build_embed(problem: dict) -> discord.Embed:
-    # Formats the MP nicely for Discord.
     title = f"🧩 DAILY MACHINE PROBLEM • {problem['title']}"
     desc = (
         "```fix\n"
@@ -208,41 +229,60 @@ def build_embed(problem: dict) -> discord.Embed:
     return embed
 
 # =========================
-# JUDGE HELPERS (Windows-safe)
+# JUDGE HELPERS
 # =========================
 CODE_BLOCK_RE = re.compile(r"```(?:cpp|c\+\+)?\s*([\s\S]*?)```", re.IGNORECASE)
 
 def extract_cpp_from_message(content: str) -> Optional[str]:
-    # Pulls the first ```cpp ... ``` block from a message.
     m = CODE_BLOCK_RE.search(content)
     if not m:
         return None
     code = m.group(1).strip()
     return code if code else None
 
-async def read_attachment_cpp(message: discord.Message) -> Optional[str]:
-    # If they attach a .cpp file, use that.
+async def read_attachment_code(message: discord.Message) -> Optional[str]:
+    # Accept .cpp/.cc/.cxx and also .txt (common student mistake).
     if not message.attachments:
         return None
     for att in message.attachments:
-        if att.filename.lower().endswith((".cpp", ".cc", ".cxx")):
+        fn = att.filename.lower()
+        if fn.endswith((".cpp", ".cc", ".cxx", ".txt")):
             data = await att.read()
-            return data.decode("utf-8", errors="replace").strip()
+            text = data.decode("utf-8", errors="replace").strip()
+            # If they uploaded a .txt that contains a ```cpp``` block, prefer extracting it.
+            code = extract_cpp_from_message(text) or text
+            return code.strip() if code else None
     return None
 
 def exe_path(workdir: str) -> str:
     return os.path.join(workdir, "main.exe" if IS_WINDOWS else "main.out")
 
+# -------------------------
+# Better diff utilities
+# -------------------------
+def first_mismatch_line(expected: str, got: str) -> Tuple[int, str, str]:
+    e_lines = expected.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    g_lines = got.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    n = max(len(e_lines), len(g_lines))
+    for i in range(n):
+        e = e_lines[i] if i < len(e_lines) else "<missing>"
+        g = g_lines[i] if i < len(g_lines) else "<missing>"
+        if e != g:
+            return i + 1, e, g
+    return 0, "", ""
+
+def clamp_block(s: str, limit: int = 1200) -> str:
+    s = s if s.endswith("\n") else s + "\n"
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "\n... (truncated)\n"
 
 # =========================
 # SKILL ENFORCEMENT (heuristics)
 # =========================
-
 def _strip_cpp_comments_and_strings(code: str) -> str:
-    # Remove //... and /*...*/ and also strip string/char literals.
     code = re.sub(r"//.*?$", "", code, flags=re.MULTILINE)
     code = re.sub(r"/\*[\s\S]*?\*/", "", code)
-    # Replace string literals with empty quotes to preserve structure a bit
     code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
     code = re.sub(r"'(?:\\.|[^'\\])*'", "''", code)
     return code
@@ -260,20 +300,24 @@ def _has_user_defined_function(code: str) -> bool:
 
 def _has_array_usage(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    # Either C-style arrays or vector usage, plus at least one index access.
-    has_container = bool(re.search(r"\bvector\s*<|\bstd::vector\s*<|\barray\s*<|\bstd::array\s*<|\b\w+\s*\w+\s*\[\s*\d*\s*\]", code))
+
+    # container types
+    has_vector = bool(re.search(r"\b(?:std::)?vector\s*<", code))
+    has_array = bool(re.search(r"\b(?:std::)?array\s*<", code))
+    # C-style array declarations like: int a[100];  long long b[n];
+    has_c_array_decl = bool(re.search(r"\b(?:bool|char|short|int|long|long\s+long|float|double|string|std::string)\s+\w+\s*\[\s*\w*\s*\]\s*;", code))
+
+    # index access: a[i], a[i+1], etc.
     has_index = bool(re.search(r"\[[^\]]+\]", code))
-    return has_container and has_index
+
+    return (has_vector or has_array or has_c_array_decl) and has_index
 
 def _has_nested_loops(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    # Very simple nesting heuristic: if a loop keyword appears inside braces after another loop.
-    # This catches typical CS1 nested-for solutions.
-    # Look for "for/while" then later within some block another "for/while".
-    pat = re.compile(r"(for|while)\s*\([^\)]*\)\s*\{[\s\S]{0,500}?(for|while)\s*\(", re.MULTILINE)
+    pat = re.compile(r"(for|while)\s*\([^\)]*\)\s*\{[\s\S]{0,600}?(for|while)\s*\(", re.MULTILINE)
     if pat.search(code):
         return True
-    # fallback: at least 2 loops present
+    # fallback: at least 2 loops present (weak but helpful)
     return len(re.findall(r"\bfor\b|\bwhile\b", code)) >= 2
 
 def _has_bool_logic(code: str) -> bool:
@@ -282,88 +326,80 @@ def _has_bool_logic(code: str) -> bool:
 
 def _has_string_usage(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    return bool(re.search(r"\bstring\b|\bstd::string\b|getline\s*\(", code))
+    return bool(re.search(r"\b(?:std::)?string\b|getline\s*\(", code))
 
 def _has_pattern_printing(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
     has_loop = bool(re.search(r"\bfor\b|\bwhile\b", code))
-    # Patterns usually print '*' or digits in loops
-    has_star = ("*" in code) or bool(re.search(r"\*\s*\w|\w\s*\*", code))
     uses_cout = "cout" in code
-    return has_loop and uses_cout and has_star
+    # patterns: star or nested loops or repeated prints
+    has_star_or_hash = ("*" in code) or ("#" in code)
+    return has_loop and uses_cout and (has_star_or_hash or _has_nested_loops(code))
 
 def _has_math_logic_ops(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    # Look for typical ops used in these problems: %, sqrt, prime loops, digit ops
-    return bool(re.search(r"%|\bsqrt\b|\bprime\b|\bdigit\b|/|\*|\+", code))
+    return bool(re.search(r"%|\bsqrt\s*\(|\babs\s*\(|/|\*|\+|-", code))
 
 def _has_recursion(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    # Find function definitions (excluding main), then check for self-call anywhere in code.
-    fn_pat = re.compile(
-        r"(?mx)^\s*(?:[\w:\<\>\,\&\*\s]+?)\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*\{"
-    )
+    fn_pat = re.compile(r"(?mx)^\s*(?:[\w:\<\>\,\&\*\s]+?)\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*\{")
     names = [m.group(1) for m in fn_pat.finditer(code)]
     names = [n for n in names if n != "main"]
     for n in names:
-        # require at least two appearances: definition + call
         if len(re.findall(rf"\b{re.escape(n)}\s*\(", code)) >= 2:
             return True
     return False
 
 def _has_stl_usage(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    return bool(re.search(r"\bvector\s*<|\bset\s*<|\bmap\s*<|\bunordered_map\s*<|\bsort\s*\(|\bstd::sort\b", code))
+    return bool(re.search(r"\b(?:std::)?vector\s*<|\b(?:std::)?set\s*<|\b(?:std::)?map\s*<|\bunordered_map\s*<|\b(?:std::)?sort\s*\(", code))
 
 def enforce_skill(problem: dict, code: str) -> Tuple[bool, str]:
-    """Return (ok, message). Heuristic enforcement per family."""
     fam = str(problem.get("family", "")).lower()
-    if fam == "stl_intro" or fam == "stl_intro".lower() or fam == "stl_intro".replace(" ", "_"):
-        fam = "stl_intro"
 
     if fam == "arrays_basic":
         if not _has_array_usage(code):
-            return False, "❌ This is an **ARRAYS (basic)** problem. Your code must use an array/vector with indexing (`a[i]`)."
+            return False, "❌ **ARRAYS (basic)**: I didn’t detect array/vector + indexing like `a[i]`."
     elif fam == "arrays_nested":
         if not _has_array_usage(code):
-            return False, "❌ This is an **ARRAYS (nested loops)** problem. Your code must use an array/vector with indexing (`a[i]`)."
+            return False, "❌ **ARRAYS (nested)**: I didn’t detect array/vector + indexing like `a[i]`."
         if not _has_nested_loops(code):
-            return False, "❌ This is an **ARRAYS (nested loops)** problem. Your code must use **nested loops** (e.g., `for` inside `for`)."
-        # Optional restriction: discourage map usage
+            return False, "❌ **ARRAYS (nested)**: I didn’t detect **nested loops** (e.g., `for` inside `for`)."
         if re.search(r"\bmap\b|\bunordered_map\b", _strip_cpp_comments_and_strings(code)):
-            return False, "❌ This **nested loops** problem disallows `map`/`unordered_map`. Use loops (as required)."
+            return False, "❌ **ARRAYS (nested)**: `map`/`unordered_map` not allowed. Use loops as required."
     elif fam == "bool_checks":
         if not _has_bool_logic(code):
-            return False, "❌ This is a **BOOL CHECKS** problem. Your code must use boolean logic (`bool`, comparisons, true/false)."
+            return False, "❌ **BOOL CHECKS**: I didn’t detect boolean logic (`bool`, comparisons, true/false)."
     elif fam == "functions":
         if not _has_user_defined_function(code):
-            return False, "❌ This is a **FUNCTIONS** problem. You must define at least one user-defined function (besides `main`)."
+            return False, "❌ **FUNCTIONS**: Define at least one user-defined function (besides `main`)."
     elif fam == "patterns":
         if not _has_pattern_printing(code):
-            return False, "❌ This is a **PATTERNS** problem. Your solution should use loops to print the pattern (typically `cout` in loops)."
+            return False, "❌ **PATTERNS**: Use loops to print the pattern (typically `cout` inside loops)."
     elif fam == "strings":
         if not _has_string_usage(code):
-            return False, "❌ This is a **STRINGS** problem. Your code must use `string`/`std::string` or `getline`."
+            return False, "❌ **STRINGS**: Use `string`/`std::string` or `getline`."
     elif fam == "math_logic":
         if not _has_math_logic_ops(code):
-            return False, "❌ This is a **MATH/LOGIC** problem. Your code should use appropriate math operations (e.g., `%`, loops, etc.)."
+            return False, "❌ **MATH/LOGIC**: I didn’t detect typical math ops (`%`, arithmetic, etc.)."
     elif fam == "recursion":
         if not _has_recursion(code):
-            return False, "❌ This is a **RECURSION** problem. Your solution must include a recursive function (a function that calls itself)."
-    elif fam == "stl_intro" or fam == "stl_intro".lower() or fam == "stl_intro".replace(" ", "_") or fam == "stl_intro":
+            return False, "❌ **RECURSION**: I didn’t detect a recursive function (a function calling itself)."
+    elif fam == "stl_intro":
         if not _has_stl_usage(code):
-            return False, "❌ This is an **STL INTRO** problem. Your code must use STL (e.g., `vector`, `set`, `map`, or `sort`)."
+            return False, "❌ **STL INTRO**: Use STL (e.g., `vector`, `set`, `map`, or `sort`)."
 
     return True, ""
 
+# =========================
+# SUBPROCESS + JUDGE
+# =========================
 async def run_subprocess(
     cmd: List[str],
     stdin_data: Optional[bytes],
     timeout_sec: int,
     cwd: Optional[str] = None
 ) -> Tuple[int, bytes, bytes]:
-    # Runs a subprocess with a timeout and returns (exit_code, stdout, stderr).
-    # On Windows, create a new process group so we can kill the tree on timeout.
     creationflags = 0
     if IS_WINDOWS:
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -383,7 +419,6 @@ async def run_subprocess(
     except asyncio.TimeoutError:
         try:
             if IS_WINDOWS:
-                # Kill the whole process tree (common fix for stuck student code)
                 killp = await asyncio.create_subprocess_exec(
                     "taskkill", "/PID", str(proc.pid), "/T", "/F",
                     stdout=asyncio.subprocess.DEVNULL,
@@ -397,14 +432,13 @@ async def run_subprocess(
         return -999, b"", b"TIMEOUT"
 
 async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
-    # Writes code to main.cpp and compiles it.
     src = os.path.join(workdir, "main.cpp")
     exe = exe_path(workdir)
 
     with open(src, "w", encoding="utf-8") as f:
         f.write(code + "\n")
 
-    cmd = [GPP, "-std=c++17", src, "-o", exe]
+    cmd = [GPP, "-std=c++17", src, "-O2", "-pipe", "-o", exe]
 
     logging.info("JUDGE: compiler=%s", GPP)
     logging.info("JUDGE: compiling: %s", " ".join(cmd))
@@ -418,10 +452,9 @@ async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
         return False, "Compilation timed out."
 
     msg = (out.decode("utf-8", errors="replace") + "\n" + err.decode("utf-8", errors="replace")).strip()
-    return False, msg if msg else "Compilation failed (no output). Check that GPP points to g++.exe."
+    return False, msg if msg else "Compilation failed (no output). Check that GPP points to g++."
 
 async def run_one_test(workdir: str, t: Dict[str, Any]) -> Tuple[bool, str, Optional[dict]]:
-    # Runs one hidden test and returns pass/fail + details for feedback.
     exe = exe_path(workdir)
     inp = t["inp"].encode("utf-8")
     expected = normalize_output(t["out"])
@@ -450,7 +483,6 @@ async def run_one_test(workdir: str, t: Dict[str, Any]) -> Tuple[bool, str, Opti
 # =========================
 @tasks.loop(time=POST_TIME)
 async def post_daily_problem():
-    # Scheduled daily post (PH time).
     if DAILY_CHANNEL_ID == 0:
         logging.warning("DAILY_CHANNEL_ID not set.")
         return
@@ -483,33 +515,37 @@ async def post_daily_problem():
 
 @post_daily_problem.before_loop
 async def before_post_daily():
-    # Wait until the bot is connected before starting the scheduler.
     await bot.wait_until_ready()
     logging.info("CS1 Judge armed.")
 
 @bot.event
 async def on_ready():
     logging.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
+
+    # Startup config log (no token leak)
+    logging.info("Config: DAILY_CHANNEL_ID=%s SUBMIT_CHANNEL_ID=%s ENFORCE_SKILLS=%s ADMIN_ROLES=%s",
+                 DAILY_CHANNEL_ID, SUBMIT_CHANNEL_ID, ENFORCE_SKILLS, ADMIN_ROLES)
+    logging.info("Config: COMPILE_TIMEOUT=%ss RUN_TIMEOUT=%ss MAX_CODE_BYTES=%s COOLDOWN=%ss",
+                 COMPILE_TIMEOUT_SEC, RUN_TIMEOUT_SEC, MAX_CODE_BYTES, SUBMIT_COOLDOWN_SEC)
+
     if not post_daily_problem.is_running():
         post_daily_problem.start()
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
-    # Don’t spam chat on typos/unknown commands.
     if isinstance(error, commands.CommandNotFound):
         return
     await ctx.send(f"❌ {type(error).__name__}: {error}")
 
 # =========================
-# COMMANDS
+# STUDENT COMMANDS
 # =========================
 @bot.command()
 async def ping(ctx: commands.Context):
     await ctx.send("pong")
-    
+
 @bot.command(name="today")
 async def today(ctx: commands.Context):
-    # Re-sends today’s stored MP (so students can pull it again).
     state = load_state()
     date_str = today_str_ph()
     p = state.get("problems_by_date", {}).get(date_str)
@@ -518,15 +554,142 @@ async def today(ctx: commands.Context):
         return
     await ctx.send(embed=build_embed(p))
 
+@bot.command(name="rules")
+async def rules(ctx: commands.Context):
+    await ctx.send(
+        "**How to Submit (C++ only)**\n"
+        "1) Type `!submit` and paste your full code inside a cpp block:\n"
+        "```cpp\n"
+        "#include <bits/stdc++.h>\n"
+        "using namespace std;\n"
+        "int main(){\n"
+        "  ios::sync_with_stdio(false);\n"
+        "  cin.tie(nullptr);\n"
+        "  // solve...\n"
+        "  return 0;\n"
+        "}\n"
+        "```\n"
+        "2) No extra prompts like `Enter n:`.\n"
+        "3) Output must match exactly.\n"
+    )
+
+@bot.command(name="format")
+async def format_cmd(ctx: commands.Context):
+    await rules(ctx)
+
+# =========================
+# ADMIN COMMANDS
+# =========================
+@bot.command(name="status")
+async def status(ctx: commands.Context):
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
+        return
+
+    state = load_state()
+    date_str = today_str_ph()
+    stored = date_str in state.get("problems_by_date", {})
+    di = int(state.get("day_index", 0))
+    up = int(time.monotonic() - BOT_START_MONO)
+    nxt = next_post_time_ph()
+
+    await ctx.send(
+        "**Bot Status**\n"
+        f"- Uptime: `{up}s`\n"
+        f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
+        f"- Day index: `{di}`\n"
+        f"- Today stored: `{stored}` ({date_str})\n"
+        f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
+        f"- DAILY_CHANNEL_ID: `{DAILY_CHANNEL_ID}`\n"
+        f"- SUBMIT_CHANNEL_ID: `{SUBMIT_CHANNEL_ID}`\n"
+        f"- GPP: `{GPP}`\n"
+    )
+
+@bot.command(name="postnow")
+async def postnow(ctx: commands.Context):
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
+        return
+
+    if DAILY_CHANNEL_ID == 0:
+        await ctx.send("❌ DAILY_CHANNEL_ID not set.")
+        return
+
+    channel = bot.get_channel(DAILY_CHANNEL_ID)
+    if channel is None:
+        await ctx.send("❌ Daily channel not found. Check DAILY_CHANNEL_ID.")
+        return
+
+    state = load_state()
+    date_str = today_str_ph()
+
+    existing = state.get("problems_by_date", {}).get(date_str)
+    if existing:
+        await channel.send("⚙️ **DAILY MP DROP (repost):**", embed=build_embed(existing))
+        await ctx.send("✅ Reposted the already-stored problem for today.")
+        return
+
+    day_index = int(state.get("day_index", 0))
+    problem = generate_problem(day_index, date_str)
+
+    await channel.send("⚙️ **DAILY MP DROP (manual):** Solve it in C++ and submit with `!submit`.", embed=build_embed(problem))
+
+    pb = state.get("problems_by_date", {})
+    pb[date_str] = problem
+    state["problems_by_date"] = pb
+    state["day_index"] = day_index + 1
+    state["last_posted_date"] = date_str
+    save_state(state)
+
+    await ctx.send(f"✅ Posted today’s problem to <#{DAILY_CHANNEL_ID}> (day_index was {day_index}).")
+
+@bot.command(name="reset_today")
+async def reset_today(ctx: commands.Context):
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
+        return
+
+    state = load_state()
+    date_str = today_str_ph()
+    pb = state.get("problems_by_date", {})
+
+    if date_str not in pb:
+        await ctx.send("✅ Nothing to reset for today (no stored problem).")
+        return
+
+    # Remove today's problem
+    pb.pop(date_str, None)
+    state["problems_by_date"] = pb
+    state["last_posted_date"] = None  # allow schedule to post again
+
+    # Do NOT decrement day_index automatically (can cause repeats). Keep simple.
+    save_state(state)
+    await ctx.send("✅ Reset done. Use `!postnow` to post a new problem for today.")
+
+# =========================
+# SUBMIT COMMAND
+# =========================
 @bot.command(name="submit")
 async def submit(ctx: commands.Context):
-    # Main judge command: compile + run hidden tests.
+    # If another submission is running, give quick feedback before waiting.
+    if SUBMIT_LOCK.locked():
+        await ctx.send("⏳ Another submission is being judged right now. Your turn is next—please wait.")
     async with SUBMIT_LOCK:
-        # Fix: allow if both IDs are the same
+        # Channel restriction
         if SUBMIT_CHANNEL_ID and ctx.channel.id != SUBMIT_CHANNEL_ID:
             if SUBMIT_CHANNEL_ID != DAILY_CHANNEL_ID:
                 await ctx.send(f"❌ Submit only in <#{SUBMIT_CHANNEL_ID}>.")
                 return
+
+        # Cooldown
+        uid = ctx.author.id
+        now = time.monotonic()
+        last = USER_LAST_SUBMIT.get(uid, 0.0)
+        if (now - last) < SUBMIT_COOLDOWN_SEC:
+            wait = int(SUBMIT_COOLDOWN_SEC - (now - last))
+            await ctx.send(f"⏳ Cooldown: wait `{wait}s` before submitting again.")
+            return
+        USER_LAST_SUBMIT[uid] = now
 
         state = load_state()
         date_str = today_str_ph()
@@ -537,7 +700,7 @@ async def submit(ctx: commands.Context):
 
         msg: discord.Message = ctx.message
 
-        code = await read_attachment_cpp(msg)
+        code = await read_attachment_code(msg)
         if not code:
             code = extract_cpp_from_message(msg.content)
 
@@ -545,15 +708,21 @@ async def submit(ctx: commands.Context):
             await ctx.send("❌ I didn't find C++ code. Paste it inside a ```cpp``` block or attach a .cpp file.")
             return
 
-        if re.search(r'cout\s*<<\s*".*enter', code, flags=re.IGNORECASE):
-            await ctx.send("⚠️ Heads up: prompts like `Enter n:` usually cause Wrong Answer. Output should be answer only.")
+        # Code size limit
+        if len(code.encode("utf-8", errors="ignore")) > MAX_CODE_BYTES:
+            await ctx.send(f"❌ Code too large. Limit is {MAX_CODE_BYTES} bytes.")
+            return
 
+        # Prompt warnings (common)
+        if re.search(r'cout\s*<<\s*".*(enter|input|please)', code, flags=re.IGNORECASE):
+            await ctx.send("⚠️ Heads up: prompts like `Enter n:` often cause Wrong Answer. Output should be answer only.")
 
-# ✅ ENFORCE REQUIRED SKILL CATEGORY (heuristics)
-ok_skill, skill_msg = enforce_skill(problem, code)
-if not ok_skill:
-    await ctx.send(skill_msg)
-    return
+        # Skill enforcement
+        if ENFORCE_SKILLS:
+            ok_skill, skill_msg = enforce_skill(problem, code)
+            if not ok_skill:
+                await ctx.send(skill_msg + "\n(Teacher: set `ENFORCE_SKILLS=false` to disable enforcement.)")
+                return
 
         tests = problem.get("tests", [])
         status_msg = await ctx.send("🧪 Compiling...")
@@ -562,10 +731,12 @@ if not ok_skill:
             ok, cerr = await compile_cpp(code, workdir)
             if not ok:
                 cerr = cerr.strip()
-                if len(cerr) > 1800:
-                    cerr = cerr[:1800] + "\n... (truncated)"
+                USER_LAST_COMPILE_ERR[uid] = cerr
+                short = cerr
+                if len(short) > 1800:
+                    short = short[:1800] + "\n... (truncated)"
                 await status_msg.edit(content="❌ Compilation Error")
-                await ctx.send(f"```text\n{cerr}\n```")
+                await ctx.send(f"```text\n{short}\n```")
                 return
 
             await status_msg.edit(content=f"✅ Compiled. Running tests (0/{len(tests)})...")
@@ -581,106 +752,85 @@ if not ok_skill:
                     if verdict == "Wrong Answer" and details:
                         exp = details["expected"]
                         got = details["got"]
-                        await ctx.send(
-                            f"**Input**\n```text\n{tinp}```"
-                            f"**Expected**\n```text\n{exp}```"
-                            f"**Got**\n```text\n{got}```"
+
+                        line_no, e_line, g_line = first_mismatch_line(exp, got)
+
+                        msg_out = (
+                            f"**Input**\n```text\n{clamp_block(tinp, 900)}```"
+                            f"**Expected**\n```text\n{clamp_block(exp, 900)}```"
+                            f"**Got**\n```text\n{clamp_block(got, 900)}```"
                         )
+                        if line_no:
+                            msg_out += f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
+                        await ctx.send(msg_out)
                     else:
                         if tinp:
-                            await ctx.send(f"**Input**\n```text\n{tinp}```")
+                            await ctx.send(f"**Input**\n```text\n{clamp_block(tinp, 1200)}```")
                     return
 
             await status_msg.edit(content=f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.")
             await ctx.send(f"Problem: **{problem['title']}** (Day {problem['day']})")
 
-@bot.command(name="chelp")
-async def help(ctx: commands.Context):
-    msg = """**COMMANDS:**
-```
-!submit
-`\u200B`\u200B`\u200Bcpp
-statements...
-`\u200B`\u200B`\u200B
-```→ Submit your code
-`!today` → Resends today's machine problem
-`!help` → Shows this guide
-"""
-    await ctx.send(msg)
-
-
 # =========================
-# DEV COMMANDS
+# DEV COMMANDS (Teacher tools)
 # =========================
 @bot.command(name="dev")
-@commands.has_role("Root Admin")  # replace with actual role
 async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, kind: Optional[str] = None):
-    """
-    Combined dev command:
-    - !dev pick <family> <kind> → picks today's problem manually
-    - !dev pick_random [family] → picks random problem (optionally from a specific family)
-    - !dev show_variants → lists all families + kinds
-    - !dev submit → submits code for debug/testing (debug only)
-    - !dev help → shows all dev commands
-    """
+    # Admin-only dev command bundle.
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
+        return
 
     state = load_state()
     date_str = today_str_ph()
+    action = action.lower().strip()
 
-    action = action.lower()
-
-    # --------------------
-    # !dev setup
-    # --------------------
+    if action == "help":
+        await ctx.send(
+            "**DEV COMMANDS:**\n"
+            "`!dev list` → list all families/kinds\n"
+            "`!dev random [family]` → pick random problem\n"
+            "`!dev pick <family> <kind>` → pick specific problem\n"
+            "`!dev submit` → judge your code in this channel (admin testing)\n"
+            "`!dev postnow` → same as `!postnow`\n"
+            "`!dev reset_today` → same as `!reset_today`\n"
+            "`!dev setup` → show runtime config\n"
+        )
+        return
 
     if action == "setup":
-        # Quick sanity-check command for admins.
         ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
         await ctx.send(
             f"✅ Bot online.\n"
             f"- Daily channel ID: `{DAILY_CHANNEL_ID}` (name: `{getattr(ch, 'name', None)}`)\n"
             f"- Submit channel ID: `{SUBMIT_CHANNEL_ID}` (0 means any channel)\n"
             f"- Post time: `{POST_TIME}` (PH time)\n"
+            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
             f"- Windows mode: `{IS_WINDOWS}`\n"
-            f"- GPP: `{GPP}`"
+            f"- GPP: `{GPP}`\n"
+            f"- ADMIN_ROLES: `{ADMIN_ROLES}`"
         )
-
-    # --------------------
-    # !dev help
-    # --------------------
-    elif action == "help":
-        msg = (
-            "**DEV COMMANDS:**\n"
-            "`!dev pick <family> <kind>` → Manually pick a problem\n"
-            "`!dev random` → Picks random family & kind\n"
-            "`!dev random <family>` → Picks random kind from specific family\n"
-            "`!dev list` → Lists all machine problems\n"
-            "`!dev submit` → Submits code for debug/testing\n"
-            "`!dev setup` → Shows this bot's status"
-            "`!dev help` → Shows this guide"
-        )
-        await ctx.send(msg)
         return
 
-    # --------------------
-    # !dev list
-    # --------------------
-    elif action == "list":
+    if action == "postnow":
+        await postnow(ctx)
+        return
+
+    if action == "reset_today":
+        await reset_today(ctx)
+        return
+
+    if action == "list":
         msg = "**FAMILIES AND KINDS:**\n"
         total_count = 0
         for f, kinds in family_kinds.items():
             msg += f"- **{f}**: {', '.join(f'`{k}`' for k in kinds)}\n"
-            total_count += len(kinds)  # add the number of elements in this family
-
+            total_count += len(kinds)
         msg += f"\n**Total:** {total_count}"
         await ctx.send(msg)
         return
 
-    # --------------------
-    # !dev random [family]
-    # --------------------
-    elif action == "random":
-        # Random family if not specified
+    if action == "random":
         if family is None:
             family = random.choice(list(family_kinds.keys()))
         elif family not in family_kinds:
@@ -689,7 +839,6 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
             return
 
         kind = random.choice(family_kinds[family])
-        # Now reuse your pick logic
         day_index = 0
         seed = stable_seed_for_day(day_index, date_str)
         rng = random.Random(seed)
@@ -734,27 +883,20 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
         await ctx.send(f"⚙️ **DEV PICK RANDOM:** {family} • {kind}", embed=build_embed(p))
         return
 
-    # --------------------
-    # !dev pick <family> <kind>
-    # --------------------
-    elif action == "pick":
-        # Normalize input
+    if action == "pick":
         family = (family or "").lower().strip()
         kind = (kind or "").strip()
 
-        # Case 1: Family missing or invalid
         if not family or family not in family_kinds:
             families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
             await ctx.send(f"❌ Invalid or missing family. Available families:\n{families_list}")
             return
 
-        # Case 2: Kind missing or invalid
         if not kind or kind not in family_kinds[family]:
             kinds_list = ", ".join(f"`{k}`" for k in family_kinds[family])
             await ctx.send(f"❌ Invalid or missing kind for family `{family}`. Available kinds:\n{kinds_list}")
             return
 
-        # Now we have valid family and kind, generate the problem
         day_index = 0
         seed = stable_seed_for_day(day_index, date_str)
         rng = random.Random(seed)
@@ -785,7 +927,6 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
             await ctx.send(f"❌ {e}")
             return
 
-        # Stamp metadata and save state
         p["day"] = date_str
         p["seed"] = seed
         p["day_index"] = day_index
@@ -800,24 +941,14 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
         await ctx.send(f"⚙️ **DEV PICK:** {family} • {kind}", embed=build_embed(p))
         return
 
-
-    # --------------------
-    # !dev submit
-    # --------------------
-    # Keep your existing submit code here (unchanged)
-    elif action == "submit":
-        # Only allowed in DAILY_CHANNEL_ID
+    if action == "submit":
+        # Admin testing: judge code provided in the same message.
         if ctx.channel.id != DAILY_CHANNEL_ID:
             await ctx.send(f"❌ `!dev submit` only works in <#{DAILY_CHANNEL_ID}>.")
             return
 
-        # Only allowed for Root Admin role
-        if "Root Admin" not in [r.name for r in ctx.author.roles]:
-            await ctx.send("❌ You are not allowed to use `!dev submit`.")
-            return
-
         msg: discord.Message = ctx.message
-        code = await read_attachment_cpp(msg) or extract_cpp_from_message(msg.content)
+        code = await read_attachment_code(msg) or extract_cpp_from_message(msg.content)
 
         if not code:
             await ctx.send("❌ No C++ code found in message or attachment.")
@@ -828,11 +959,11 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
             await ctx.send("❌ No active problem for today. Pick one first with `!dev pick`.")
             return
 
-        # ✅ ENFORCE REQUIRED SKILL CATEGORY (heuristics)
-        ok_skill, skill_msg = enforce_skill(problem, code)
-        if not ok_skill:
-            await ctx.send('[DEV] ' + skill_msg)
-            return
+        if ENFORCE_SKILLS:
+            ok_skill, skill_msg = enforce_skill(problem, code)
+            if not ok_skill:
+                await ctx.send("[DEV] " + skill_msg)
+                return
 
         async with SUBMIT_LOCK:
             status_msg = await ctx.send("🧪 [DEV] Compiling...")
@@ -858,22 +989,25 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
                         if verdict == "Wrong Answer" and details:
                             exp = details["expected"]
                             got = details["got"]
-                            await ctx.send(
-                                f"**Input**\n```text\n{tinp}```"
-                                f"**Expected**\n```text\n{exp}```"
-                                f"**Got**\n```text\n{got}```"
+                            line_no, e_line, g_line = first_mismatch_line(exp, got)
+                            out_msg = (
+                                f"**Input**\n```text\n{clamp_block(tinp, 900)}```"
+                                f"**Expected**\n```text\n{clamp_block(exp, 900)}```"
+                                f"**Got**\n```text\n{clamp_block(got, 900)}```"
                             )
+                            if line_no:
+                                out_msg += f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
+                            await ctx.send(out_msg)
                         else:
                             if tinp:
-                                await ctx.send(f"**Input**\n```text\n{tinp}```")
+                                await ctx.send(f"**Input**\n```text\n{clamp_block(tinp, 1200)}```")
                         return
 
-                await status_msg.edit(content=f"✅ [DEV] Accepted — all tests passed.")
+                await status_msg.edit(content="✅ [DEV] Accepted — all tests passed.")
                 await ctx.send(f"[DEV] Problem: **{problem['title']}** (Day {problem['day']})")
+        return
 
-    else:
-        await ctx.send("❌ Invalid `!dev` action. Use `pick`, `random`, `list`, `submit`, `setup`, or `help`.")
-
+    await ctx.send("❌ Invalid `!dev` action. Use `help`, `list`, `random`, `pick`, `submit`, `postnow`, `reset_today`, `setup`.")
 
 # =========================
 # STARTUP CHECKS
