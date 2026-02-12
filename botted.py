@@ -233,6 +233,129 @@ async def read_attachment_cpp(message: discord.Message) -> Optional[str]:
 def exe_path(workdir: str) -> str:
     return os.path.join(workdir, "main.exe" if IS_WINDOWS else "main.out")
 
+
+# =========================
+# SKILL ENFORCEMENT (heuristics)
+# =========================
+
+def _strip_cpp_comments_and_strings(code: str) -> str:
+    # Remove //... and /*...*/ and also strip string/char literals.
+    code = re.sub(r"//.*?$", "", code, flags=re.MULTILINE)
+    code = re.sub(r"/\*[\s\S]*?\*/", "", code)
+    # Replace string literals with empty quotes to preserve structure a bit
+    code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
+    code = re.sub(r"'(?:\\.|[^'\\])*'", "''", code)
+    return code
+
+def _has_user_defined_function(code: str) -> bool:
+    code = _strip_cpp_comments_and_strings(code)
+    fn_pat = re.compile(
+        r"(?mx)^\s*(?:template\s*<[^>]+>\s*)?"
+        r"(?:static\s+|inline\s+|constexpr\s+|friend\s+)?*"
+        r"(?:[\w:\<\>\,\&\*\s]+?)\s+"
+        r"([A-Za-z_]\w*)\s*\([^;]*\)\s*(?:const\s*)?\{"
+    )
+    names = [m.group(1) for m in fn_pat.finditer(code)]
+    return any(n != "main" for n in names)
+
+def _has_array_usage(code: str) -> bool:
+    code = _strip_cpp_comments_and_strings(code)
+    # Either C-style arrays or vector usage, plus at least one index access.
+    has_container = bool(re.search(r"\bvector\s*<|\bstd::vector\s*<|\barray\s*<|\bstd::array\s*<|\b\w+\s*\w+\s*\[\s*\d*\s*\]", code))
+    has_index = bool(re.search(r"\[[^\]]+\]", code))
+    return has_container and has_index
+
+def _has_nested_loops(code: str) -> bool:
+    code = _strip_cpp_comments_and_strings(code)
+    # Very simple nesting heuristic: if a loop keyword appears inside braces after another loop.
+    # This catches typical CS1 nested-for solutions.
+    # Look for "for/while" then later within some block another "for/while".
+    pat = re.compile(r"(for|while)\s*\([^\)]*\)\s*\{[\s\S]{0,500}?(for|while)\s*\(", re.MULTILINE)
+    if pat.search(code):
+        return True
+    # fallback: at least 2 loops present
+    return len(re.findall(r"\bfor\b|\bwhile\b", code)) >= 2
+
+def _has_bool_logic(code: str) -> bool:
+    code = _strip_cpp_comments_and_strings(code)
+    return bool(re.search(r"\bbool\b|\btrue\b|\bfalse\b|==|!=|<=|>=|<|>", code))
+
+def _has_string_usage(code: str) -> bool:
+    code = _strip_cpp_comments_and_strings(code)
+    return bool(re.search(r"\bstring\b|\bstd::string\b|getline\s*\(", code))
+
+def _has_pattern_printing(code: str) -> bool:
+    code = _strip_cpp_comments_and_strings(code)
+    has_loop = bool(re.search(r"\bfor\b|\bwhile\b", code))
+    # Patterns usually print '*' or digits in loops
+    has_star = ("*" in code) or bool(re.search(r"\*\s*\w|\w\s*\*", code))
+    uses_cout = "cout" in code
+    return has_loop and uses_cout and has_star
+
+def _has_math_logic_ops(code: str) -> bool:
+    code = _strip_cpp_comments_and_strings(code)
+    # Look for typical ops used in these problems: %, sqrt, prime loops, digit ops
+    return bool(re.search(r"%|\bsqrt\b|\bprime\b|\bdigit\b|/|\*|\+", code))
+
+def _has_recursion(code: str) -> bool:
+    code = _strip_cpp_comments_and_strings(code)
+    # Find function definitions (excluding main), then check for self-call anywhere in code.
+    fn_pat = re.compile(
+        r"(?mx)^\s*(?:[\w:\<\>\,\&\*\s]+?)\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*\{"
+    )
+    names = [m.group(1) for m in fn_pat.finditer(code)]
+    names = [n for n in names if n != "main"]
+    for n in names:
+        # require at least two appearances: definition + call
+        if len(re.findall(rf"\b{re.escape(n)}\s*\(", code)) >= 2:
+            return True
+    return False
+
+def _has_stl_usage(code: str) -> bool:
+    code = _strip_cpp_comments_and_strings(code)
+    return bool(re.search(r"\bvector\s*<|\bset\s*<|\bmap\s*<|\bunordered_map\s*<|\bsort\s*\(|\bstd::sort\b", code))
+
+def enforce_skill(problem: dict, code: str) -> Tuple[bool, str]:
+    """Return (ok, message). Heuristic enforcement per family."""
+    fam = str(problem.get("family", "")).lower()
+    if fam == "stl_intro" or fam == "stl_intro".lower() or fam == "stl_intro".replace(" ", "_"):
+        fam = "stl_intro"
+
+    if fam == "arrays_basic":
+        if not _has_array_usage(code):
+            return False, "❌ This is an **ARRAYS (basic)** problem. Your code must use an array/vector with indexing (`a[i]`)."
+    elif fam == "arrays_nested":
+        if not _has_array_usage(code):
+            return False, "❌ This is an **ARRAYS (nested loops)** problem. Your code must use an array/vector with indexing (`a[i]`)."
+        if not _has_nested_loops(code):
+            return False, "❌ This is an **ARRAYS (nested loops)** problem. Your code must use **nested loops** (e.g., `for` inside `for`)."
+        # Optional restriction: discourage map usage
+        if re.search(r"\bmap\b|\bunordered_map\b", _strip_cpp_comments_and_strings(code)):
+            return False, "❌ This **nested loops** problem disallows `map`/`unordered_map`. Use loops (as required)."
+    elif fam == "bool_checks":
+        if not _has_bool_logic(code):
+            return False, "❌ This is a **BOOL CHECKS** problem. Your code must use boolean logic (`bool`, comparisons, true/false)."
+    elif fam == "functions":
+        if not _has_user_defined_function(code):
+            return False, "❌ This is a **FUNCTIONS** problem. You must define at least one user-defined function (besides `main`)."
+    elif fam == "patterns":
+        if not _has_pattern_printing(code):
+            return False, "❌ This is a **PATTERNS** problem. Your solution should use loops to print the pattern (typically `cout` in loops)."
+    elif fam == "strings":
+        if not _has_string_usage(code):
+            return False, "❌ This is a **STRINGS** problem. Your code must use `string`/`std::string` or `getline`."
+    elif fam == "math_logic":
+        if not _has_math_logic_ops(code):
+            return False, "❌ This is a **MATH/LOGIC** problem. Your code should use appropriate math operations (e.g., `%`, loops, etc.)."
+    elif fam == "recursion":
+        if not _has_recursion(code):
+            return False, "❌ This is a **RECURSION** problem. Your solution must include a recursive function (a function that calls itself)."
+    elif fam == "stl_intro" or fam == "stl_intro".lower() or fam == "stl_intro".replace(" ", "_") or fam == "stl_intro":
+        if not _has_stl_usage(code):
+            return False, "❌ This is an **STL INTRO** problem. Your code must use STL (e.g., `vector`, `set`, `map`, or `sort`)."
+
+    return True, ""
+
 async def run_subprocess(
     cmd: List[str],
     stdin_data: Optional[bytes],
@@ -424,6 +547,13 @@ async def submit(ctx: commands.Context):
 
         if re.search(r'cout\s*<<\s*".*enter', code, flags=re.IGNORECASE):
             await ctx.send("⚠️ Heads up: prompts like `Enter n:` usually cause Wrong Answer. Output should be answer only.")
+
+
+        # ✅ ENFORCE REQUIRED SKILL CATEGORY (heuristics)
+        ok_skill, skill_msg = enforce_skill(problem, code)
+        if not ok_skill:
+            await ctx.send(skill_msg)
+            return
 
         tests = problem.get("tests", [])
         status_msg = await ctx.send("🧪 Compiling...")
@@ -696,6 +826,12 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
         problem = state.get("problems_by_date", {}).get(date_str)
         if not problem:
             await ctx.send("❌ No active problem for today. Pick one first with `!dev pick`.")
+            return
+
+        # ✅ ENFORCE REQUIRED SKILL CATEGORY (heuristics)
+        ok_skill, skill_msg = enforce_skill(problem, code)
+        if not ok_skill:
+            await ctx.send('[DEV] ' + skill_msg)
             return
 
         async with SUBMIT_LOCK:
