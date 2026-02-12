@@ -24,6 +24,7 @@ import asyncio
 import tempfile
 import subprocess
 import time
+import shutil
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -68,12 +69,17 @@ POST_TIME = datetime.time(hour=9, minute=0, tzinfo=PH_TZ)
 COMPILE_TIMEOUT_SEC = int(os.getenv("COMPILE_TIMEOUT_SEC", "12"))
 RUN_TIMEOUT_SEC = int(os.getenv("RUN_TIMEOUT_SEC", "2"))
 MAX_OUTPUT_BYTES = int(os.getenv("MAX_OUTPUT_BYTES", "64000"))
+MAX_RUN_MEMORY_MB = int(os.getenv("MAX_RUN_MEMORY_MB", "256"))
+MAX_RUN_NPROC = int(os.getenv("MAX_RUN_NPROC", "64"))
+MAX_RUN_CPU_SEC = int(os.getenv("MAX_RUN_CPU_SEC", "3"))
 
 # Code size limit (to avoid abuse)
 MAX_CODE_BYTES = int(os.getenv("MAX_CODE_BYTES", "100000"))  # ~100KB
 
 # Cooldown per user to avoid spam
 SUBMIT_COOLDOWN_SEC = int(os.getenv("SUBMIT_COOLDOWN_SEC", "15"))
+COOLDOWN_AFTER_ACCEPT_SEC = int(os.getenv("COOLDOWN_AFTER_ACCEPT_SEC", str(SUBMIT_COOLDOWN_SEC)))
+COOLDOWN_AFTER_FAIL_SEC = int(os.getenv("COOLDOWN_AFTER_FAIL_SEC", str(SUBMIT_COOLDOWN_SEC)))
 
 # Toggle skill enforcement quickly if you need to
 ENFORCE_SKILLS = os.getenv("ENFORCE_SKILLS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -98,6 +104,33 @@ SUBMIT_LOCK = asyncio.Lock()
 BOT_START_MONO = time.monotonic()
 USER_LAST_SUBMIT: Dict[int, float] = {}
 USER_LAST_COMPILE_ERR: Dict[int, str] = {}
+JUDGE_METRICS: Dict[str, int] = {
+    "submissions": 0,
+    "accepted": 0,
+    "compile_errors": 0,
+    "wrong_answers": 0,
+    "runtime_errors": 0,
+    "timeouts": 0,
+    "output_limit_exceeded": 0,
+}
+
+ERR_CONFIG = "CFG001"
+ERR_NO_CODE = "SUB001"
+ERR_AMBIGUOUS_CODE = "SUB002"
+ERR_CODE_TOO_LARGE = "SUB003"
+ERR_COMPILE_TIMEOUT = "JDG101"
+ERR_COMPILE_FAIL = "JDG102"
+ERR_RUN_TIMEOUT = "JDG201"
+ERR_RUNTIME = "JDG202"
+ERR_WRONG_ANSWER = "JDG203"
+ERR_OUTPUT_LIMIT = "JDG204"
+ERR_INTERNAL = "JDG500"
+
+SKILL_HARD_FAIL_CONFIDENCE = float(os.getenv("SKILL_HARD_FAIL_CONFIDENCE", "0.75"))
+SKILL_WARN_CONFIDENCE = float(os.getenv("SKILL_WARN_CONFIDENCE", "0.45"))
+HINTS_PER_DAY_LIMIT = int(os.getenv("HINTS_PER_DAY_LIMIT", "5"))
+
+BOT_UPDATES_VERSION = "2026-02-reapply"
 
 # =========================
 # DISCORD BOT SETUP
@@ -127,14 +160,38 @@ def next_post_time_ph(now: Optional[datetime.datetime] = None) -> datetime.datet
 # =========================
 # STATE HELPERS
 # =========================
+def default_state() -> dict:
+    return {
+        "day_index": 0,
+        "last_posted_date": None,
+        "problems_by_date": {},
+        "cooldowns": {},
+        "compile_errors": {},
+        "hint_usage": {},
+        "scores": {},
+        "audit_log": [],
+    }
+
+
+def _state_with_defaults(raw: dict) -> dict:
+    base = default_state()
+    base.update(raw or {})
+    for k in ("problems_by_date", "cooldowns", "compile_errors", "hint_usage", "scores"):
+        if not isinstance(base.get(k), dict):
+            base[k] = {}
+    if not isinstance(base.get("audit_log"), list):
+        base["audit_log"] = []
+    return base
+
+
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return {"day_index": 0, "last_posted_date": None, "problems_by_date": {}}
+        return default_state()
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            return _state_with_defaults(json.load(f))
     except Exception:
-        return {"day_index": 0, "last_posted_date": None, "problems_by_date": {}}
+        return default_state()
 
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -142,6 +199,89 @@ def save_state(state: dict) -> None:
 
 def today_str_ph() -> str:
     return datetime.datetime.now(PH_TZ).date().isoformat()
+
+
+def current_week_key_ph() -> str:
+    now = datetime.datetime.now(PH_TZ).date()
+    iso = now.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def append_audit(state: dict, entry: dict) -> None:
+    logs = state.get("audit_log", [])
+    logs.append({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), **entry})
+    state["audit_log"] = logs[-250:]
+
+
+def cooldown_remaining_sec(state: dict, user_id: int) -> int:
+    key = str(user_id)
+    now = time.time()
+    until = float(state.get("cooldowns", {}).get(key, 0.0))
+    return max(0, int(until - now))
+
+
+def set_cooldown(state: dict, user_id: int, sec: int) -> None:
+    state.setdefault("cooldowns", {})[str(user_id)] = time.time() + max(0, sec)
+
+
+def record_compile_error(state: dict, user_id: int, msg: str) -> None:
+    state.setdefault("compile_errors", {})[str(user_id)] = {
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "msg": msg[:2000],
+    }
+
+
+def _score_row(state: dict, user_id: int, display: str) -> dict:
+    scores = state.setdefault("scores", {})
+    row = scores.get(str(user_id), {
+        "name": display,
+        "accepted": 0,
+        "submissions": 0,
+        "streak": 0,
+        "last_accept_date": None,
+        "week_key": current_week_key_ph(),
+        "weekly_accepts": 0,
+    })
+    row["name"] = display
+    if row.get("week_key") != current_week_key_ph():
+        row["week_key"] = current_week_key_ph()
+        row["weekly_accepts"] = 0
+    scores[str(user_id)] = row
+    return row
+
+
+def score_submission(state: dict, user_id: int, display: str, accepted: bool, date_str: str) -> None:
+    row = _score_row(state, user_id, display)
+    row["submissions"] += 1
+    if not accepted:
+        return
+    row["accepted"] += 1
+    row["weekly_accepts"] += 1
+    prev = row.get("last_accept_date")
+    if prev:
+        try:
+            prev_d = datetime.date.fromisoformat(prev)
+            cur_d = datetime.date.fromisoformat(date_str)
+            delta = (cur_d - prev_d).days
+            if delta == 1:
+                row["streak"] = int(row.get("streak", 0)) + 1
+            elif delta > 1:
+                row["streak"] = 1
+        except Exception:
+            row["streak"] = 1
+    else:
+        row["streak"] = 1
+    row["last_accept_date"] = date_str
+
+
+def consume_hint(state: dict, user_id: int, date_str: str) -> Tuple[bool, int]:
+    usage = state.setdefault("hint_usage", {})
+    per_user = usage.setdefault(str(user_id), {})
+    used = int(per_user.get(date_str, 0))
+    if used >= HINTS_PER_DAY_LIMIT:
+        return False, used
+    per_user[date_str] = used + 1
+    return True, used + 1
 
 # =========================
 # PROBLEM MODEL
@@ -236,26 +376,46 @@ def build_embed(problem: dict) -> discord.Embed:
 # =========================
 CODE_BLOCK_RE = re.compile(r"```(?:cpp|c\+\+)?\s*([\s\S]*?)```", re.IGNORECASE)
 
-def extract_cpp_from_message(content: str) -> Optional[str]:
-    m = CODE_BLOCK_RE.search(content)
-    if not m:
-        return None
-    code = m.group(1).strip()
-    return code if code else None
+def extract_cpp_blocks(content: str) -> List[str]:
+    return [m.group(1).strip() for m in CODE_BLOCK_RE.finditer(content or "") if m.group(1).strip()]
 
-async def read_attachment_code(message: discord.Message) -> Optional[str]:
-    # Accept .cpp/.cc/.cxx and also .txt (common student mistake).
-    if not message.attachments:
-        return None
+async def extract_submission_code(message: discord.Message) -> Tuple[Optional[str], Optional[str]]:
+    candidates: List[Tuple[str, str]] = []
+    for idx, block in enumerate(extract_cpp_blocks(message.content), start=1):
+        candidates.append((f"message_code_block_{idx}", block))
+
     for att in message.attachments:
         fn = att.filename.lower()
         if fn.endswith((".cpp", ".cc", ".cxx", ".txt")):
             data = await att.read()
             text = data.decode("utf-8", errors="replace").strip()
-            # If they uploaded a .txt that contains a ```cpp``` block, prefer extracting it.
-            code = extract_cpp_from_message(text) or text
-            return code.strip() if code else None
-    return None
+            blocks = extract_cpp_blocks(text)
+            if blocks:
+                for idx, block in enumerate(blocks, start=1):
+                    candidates.append((f"attachment:{att.filename}:block_{idx}", block))
+            elif text:
+                candidates.append((f"attachment:{att.filename}", text))
+
+    if not candidates:
+        return None, f"{ERR_NO_CODE}: I didn't find C++ code. Paste one ```cpp``` block or attach one .cpp file."
+    if len(candidates) > 1:
+        names = ", ".join(name for name, _ in candidates[:4])
+        suffix = "..." if len(candidates) > 4 else ""
+        return None, f"{ERR_AMBIGUOUS_CODE}: Found multiple code payloads ({names}{suffix}). Submit exactly one source payload."
+    return candidates[0][1], None
+
+
+
+def extract_cpp_from_message(content: str) -> Optional[str]:
+    blocks = extract_cpp_blocks(content)
+    return blocks[0] if blocks else None
+
+
+async def read_attachment_code(message: discord.Message) -> Optional[str]:
+    code, err = await extract_submission_code(message)
+    if err:
+        return None
+    return code
 
 def exe_path(workdir: str) -> str:
     return os.path.join(workdir, "main.exe" if IS_WINDOWS else "main.out")
@@ -440,42 +600,42 @@ def _has_stl_usage(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
     return bool(re.search(r"\b(?:std::)?vector\s*<|\b(?:std::)?set\s*<|\b(?:std::)?map\s*<|\bunordered_map\s*<|\b(?:std::)?sort\s*\(", code))
 
-def enforce_skill(problem: dict, code: str) -> Tuple[bool, str]:
+def enforce_skill(problem: dict, code: str) -> Tuple[bool, str, float]:
     fam = str(problem.get("family", "")).lower()
 
     if fam == "arrays_basic":
         if not _has_array_usage(code):
-            return False, "❌ **ARRAYS (basic)**: I didn’t detect array/vector + indexing like `a[i]`."
+            return False, "❌ **ARRAYS (basic)**: I didn’t detect array/vector + indexing like `a[i]`.", 0.85
     elif fam == "arrays_nested":
         if not _has_array_usage(code):
-            return False, "❌ **ARRAYS (nested)**: I didn’t detect array/vector + indexing like `a[i]`."
+            return False, "❌ **ARRAYS (nested)**: I didn’t detect array/vector + indexing like `a[i]`.", 0.85
         if not _has_nested_loops(code):
-            return False, "❌ **ARRAYS (nested)**: I didn’t detect **nested loops** (e.g., `for` inside `for`)."
+            return False, "❌ **ARRAYS (nested)**: I didn’t detect **nested loops** (e.g., `for` inside `for`).", 0.8
         if re.search(r"\bmap\b|\bunordered_map\b", _strip_cpp_comments_and_strings(code)):
-            return False, "❌ **ARRAYS (nested)**: `map`/`unordered_map` not allowed. Use loops as required."
+            return False, "❌ **ARRAYS (nested)**: `map`/`unordered_map` not allowed. Use loops as required.", 0.95
     elif fam == "bool_checks":
         if not _has_bool_logic(code):
-            return False, "❌ **BOOL CHECKS**: I didn’t detect boolean logic (`bool`, comparisons, true/false)."
+            return False, "❌ **BOOL CHECKS**: I didn’t detect boolean logic (`bool`, comparisons, true/false).", 0.55
     elif fam == "functions":
         if not _has_user_defined_function(code):
-            return False, "❌ **FUNCTIONS**: Define at least one user-defined function (besides `main`)."
+            return False, "❌ **FUNCTIONS**: Define at least one user-defined function (besides `main`).", 0.85
     elif fam == "patterns":
         if not _has_pattern_printing(code):
-            return False, "❌ **PATTERNS**: Use loops to print the pattern (typically `cout` inside loops)."
+            return False, "❌ **PATTERNS**: Use loops to print the pattern (typically `cout` inside loops).", 0.5
     elif fam == "strings":
         if not _has_string_usage(code):
-            return False, "❌ **STRINGS**: Use `string`/`std::string` or `getline`."
+            return False, "❌ **STRINGS**: Use `string`/`std::string` or `getline`.", 0.6
     elif fam == "math_logic":
         if not _has_math_logic_ops(code):
-            return False, "❌ **MATH/LOGIC**: I didn’t detect typical math ops (`%`, arithmetic, etc.)."
+            return False, "❌ **MATH/LOGIC**: I didn’t detect typical math ops (`%`, arithmetic, etc.).", 0.4
     elif fam == "recursion":
         if not _has_recursion(code):
-            return False, "❌ **RECURSION**: I didn’t detect a recursive function (a function calling itself)."
+            return False, "❌ **RECURSION**: I didn’t detect a recursive function (a function calling itself).", 0.9
     elif fam == "stl_intro":
         if not _has_stl_usage(code):
-            return False, "❌ **STL INTRO**: Use STL (e.g., `vector`, `set`, `map`, or `sort`)."
+            return False, "❌ **STL INTRO**: Use STL (e.g., `vector`, `set`, `map`, or `sort`).", 0.75
 
-    return True, ""
+    return True, "", 1.0
 
 # =========================
 # SUBPROCESS + JUDGE
@@ -485,10 +645,23 @@ async def run_subprocess(
     stdin_data: Optional[bytes],
     timeout_sec: int,
     cwd: Optional[str] = None
-) -> Tuple[int, bytes, bytes]:
+) -> Tuple[int, bytes, bytes, bool]:
     creationflags = 0
     if IS_WINDOWS:
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    preexec = None
+    if not IS_WINDOWS:
+        def _limit_resources() -> None:
+            try:
+                import resource
+                mem = MAX_RUN_MEMORY_MB * 1024 * 1024
+                resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+                resource.setrlimit(resource.RLIMIT_CPU, (MAX_RUN_CPU_SEC, MAX_RUN_CPU_SEC + 1))
+                resource.setrlimit(resource.RLIMIT_NPROC, (MAX_RUN_NPROC, MAX_RUN_NPROC))
+            except Exception:
+                pass
+        preexec = _limit_resources
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -497,11 +670,13 @@ async def run_subprocess(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         creationflags=creationflags,
+        preexec_fn=preexec,
     )
 
     try:
         out, err = await asyncio.wait_for(proc.communicate(stdin_data), timeout=timeout_sec)
-        return proc.returncode, out[:MAX_OUTPUT_BYTES], err[:MAX_OUTPUT_BYTES]
+        truncated = (len(out) > MAX_OUTPUT_BYTES) or (len(err) > MAX_OUTPUT_BYTES)
+        return proc.returncode, out[:MAX_OUTPUT_BYTES], err[:MAX_OUTPUT_BYTES], truncated
     except asyncio.TimeoutError:
         try:
             if IS_WINDOWS:
@@ -515,7 +690,7 @@ async def run_subprocess(
                 proc.kill()
         except Exception:
             pass
-        return -999, b"", b"TIMEOUT"
+        return -999, b"", b"TIMEOUT", False
 
 async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
     src = os.path.join(workdir, "main.cpp")
@@ -529,26 +704,26 @@ async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
     logging.info("JUDGE: compiler=%s", GPP)
     logging.info("JUDGE: compiling: %s", " ".join(cmd))
 
-    rc, out, err = await run_subprocess(cmd, stdin_data=None, timeout_sec=COMPILE_TIMEOUT_SEC, cwd=workdir)
+    rc, out, err, _ = await run_subprocess(cmd, stdin_data=None, timeout_sec=COMPILE_TIMEOUT_SEC, cwd=workdir)
 
     if rc == 0 and os.path.exists(exe):
         return True, ""
 
     if rc == -999:
-        return False, "Compilation timed out."
+        return False, f"{ERR_COMPILE_TIMEOUT}: Compilation timed out."
 
     msg = (out.decode("utf-8", errors="replace") + "\n" + err.decode("utf-8", errors="replace")).strip()
-    return False, msg if msg else "Compilation failed (no output). Check that GPP points to g++."
+    return False, (f"{ERR_COMPILE_FAIL}: " + msg) if msg else f"{ERR_COMPILE_FAIL}: Compilation failed (no output). Check that GPP points to g++."
 
 async def run_one_test(workdir: str, t: Dict[str, Any]) -> Tuple[bool, str, Optional[dict]]:
     exe = exe_path(workdir)
     inp = t["inp"].encode("utf-8")
     expected = normalize_output(t["out"])
 
-    rc, out, err = await run_subprocess([exe], stdin_data=inp, timeout_sec=RUN_TIMEOUT_SEC, cwd=workdir)
+    rc, out, err, truncated = await run_subprocess([exe], stdin_data=inp, timeout_sec=RUN_TIMEOUT_SEC, cwd=workdir)
 
     if rc == -999:
-        return False, "Time Limit Exceeded", {"test": t}
+        return False, f"{ERR_RUN_TIMEOUT}: Time Limit Exceeded", {"test": t, "kind": "timeout"}
 
     if rc != 0:
         msg = err.decode("utf-8", errors="replace").strip()
@@ -556,11 +731,14 @@ async def run_one_test(workdir: str, t: Dict[str, Any]) -> Tuple[bool, str, Opti
             msg = "Time Limit Exceeded"
         if not msg:
             msg = "Runtime Error"
-        return False, f"Runtime Error (exit {rc})\n{msg}", {"test": t}
+        return False, f"{ERR_RUNTIME}: Runtime Error (exit {rc})\n{msg}", {"test": t, "kind": "runtime"}
+
+    if truncated:
+        return False, f"{ERR_OUTPUT_LIMIT}: Output Limit Exceeded", {"test": t, "kind": "output_limit"}
 
     got = normalize_output(out.decode("utf-8", errors="replace"))
     if got != expected:
-        return False, "Wrong Answer", {"test": t, "expected": expected, "got": got}
+        return False, f"{ERR_WRONG_ANSWER}: Wrong Answer", {"test": t, "expected": expected, "got": got, "kind": "wa"}
 
     return True, "OK", None
 
@@ -716,7 +894,13 @@ async def hint_cmd(ctx: commands.Context):
     if not p:
         await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
         return
-    await ctx.send("💡 " + tutor_hints(p)[0])
+    st = load_state()
+    ok, used = consume_hint(st, ctx.author.id, today_str_ph())
+    if not ok:
+        await ctx.send(f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
+        return
+    save_state(st)
+    await ctx.send(f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) " + tutor_hints(p)[0] + "\n➡️ Next best step: implement input parsing first, then test with sample.")
 
 @bot.command(name="hint2")
 async def hint2_cmd(ctx: commands.Context):
@@ -724,8 +908,14 @@ async def hint2_cmd(ctx: commands.Context):
     if not p:
         await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
         return
+    st = load_state()
+    ok, used = consume_hint(st, ctx.author.id, today_str_ph())
+    if not ok:
+        await ctx.send(f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
+        return
+    save_state(st)
     hints = tutor_hints(p)
-    await ctx.send("💡 " + (hints[1] if len(hints) > 1 else hints[0]))
+    await ctx.send(f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) " + (hints[1] if len(hints) > 1 else hints[0]))
 
 @bot.command(name="hint3")
 async def hint3_cmd(ctx: commands.Context):
@@ -733,11 +923,17 @@ async def hint3_cmd(ctx: commands.Context):
     if not p:
         await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
         return
+    st = load_state()
+    ok, used = consume_hint(st, ctx.author.id, today_str_ph())
+    if not ok:
+        await ctx.send(f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
+        return
+    save_state(st)
     hints = tutor_hints(p)
     msg = hints[2] if len(hints) > 2 else hints[-1]
     if TUTOR_FULL_CODE:
         msg += "\n\n✅ *(Tutor mode)* `TUTOR_FULL_CODE=true` is enabled, so hints may be more explicit."
-    await ctx.send("💡 " + msg)
+    await ctx.send(f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) " + msg)
 
 @bot.command(name="dryrun")
 async def dryrun_cmd(ctx: commands.Context):
@@ -759,6 +955,19 @@ async def constraints_cmd(ctx: commands.Context):
         await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
         return
     await ctx.send(f"📌 **Constraints**\n{p.get('constraints','-')}")
+
+@bot.command(name="leaderboard")
+async def leaderboard_cmd(ctx: commands.Context):
+    st = load_state()
+    rows = list(st.get("scores", {}).values())
+    if not rows:
+        await ctx.send("No leaderboard data yet.")
+        return
+    rows.sort(key=lambda r: (int(r.get("weekly_accepts", 0)), int(r.get("accepted", 0))), reverse=True)
+    lines = ["🏆 **Weekly Leaderboard**"]
+    for i, r in enumerate(rows[:10], start=1):
+        lines.append(f"{i}. **{r.get('name','user')}** — weekly `{r.get('weekly_accepts',0)}` | total `{r.get('accepted',0)}` | streak `{r.get('streak',0)}`")
+    await ctx.send("\n".join(lines))
 
 # =========================
 # ADMIN COMMANDS
@@ -783,9 +992,12 @@ async def status(ctx: commands.Context):
         f"- Day index: `{di}`\n"
         f"- Today stored: `{stored}` ({date_str})\n"
         f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
+        f"- Queue busy: `{SUBMIT_LOCK.locked()}`\n"
         f"- DAILY_CHANNEL_ID: `{DAILY_CHANNEL_ID}`\n"
         f"- SUBMIT_CHANNEL_ID: `{SUBMIT_CHANNEL_ID}`\n"
-        f"- GPP: `{GPP}`\n"
+        f"- GPP: `{GPP}` exists=`{bool(shutil.which(GPP) or os.path.exists(GPP))}`\n"
+        f"- Metrics: `{JUDGE_METRICS}`\n"
+        f"- Updates build: `{BOT_UPDATES_VERSION}`\n"
     )
 
 @bot.command(name="postnow")
@@ -826,6 +1038,44 @@ async def postnow(ctx: commands.Context):
 
     await ctx.send(f"✅ Posted today’s problem to <#{DAILY_CHANNEL_ID}> (day_index was {day_index}).")
 
+@bot.command(name="repost_date")
+async def repost_date(ctx: commands.Context, date_str: str):
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
+        return
+    st = load_state()
+    p = st.get("problems_by_date", {}).get(date_str)
+    if not p:
+        await ctx.send("❌ No stored problem for that date.")
+        return
+    channel = bot.get_channel(DAILY_CHANNEL_ID)
+    if channel is None:
+        await ctx.send("❌ Daily channel not found.")
+        return
+    await channel.send(f"⚙️ **DAILY MP DROP (backfill {date_str}):**", embed=build_embed(p))
+    append_audit(st, {"action": "repost_date", "by": str(ctx.author), "date": date_str})
+    save_state(st)
+    await ctx.send("✅ Reposted.")
+
+@bot.command(name="regen_today")
+async def regen_today(ctx: commands.Context):
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
+        return
+    st = load_state()
+    date_str = today_str_ph()
+    di = int(st.get("day_index", 0))
+    p = generate_problem(di, date_str)
+    st.setdefault("problems_by_date", {})[date_str] = p
+    st["day_index"] = di + 1
+    st["last_posted_date"] = date_str
+    append_audit(st, {"action": "regen_today", "by": str(ctx.author), "day_index": di, "seed": p.get("seed")})
+    save_state(st)
+    ch = bot.get_channel(DAILY_CHANNEL_ID)
+    if ch:
+        await ch.send("⚙️ **DAILY MP DROP (regenerated):**", embed=build_embed(p))
+    await ctx.send(f"✅ Regenerated today's problem (seed={p.get('seed')}).")
+
 @bot.command(name="reset_today")
 async def reset_today(ctx: commands.Context):
     if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
@@ -854,27 +1104,21 @@ async def reset_today(ctx: commands.Context):
 # =========================
 @bot.command(name="submit")
 async def submit(ctx: commands.Context):
-    # If another submission is running, give quick feedback before waiting.
     if SUBMIT_LOCK.locked():
         await ctx.send("⏳ Another submission is being judged right now. Your turn is next—please wait.")
     async with SUBMIT_LOCK:
-        # Channel restriction
         if SUBMIT_CHANNEL_ID and ctx.channel.id != SUBMIT_CHANNEL_ID:
             if SUBMIT_CHANNEL_ID != DAILY_CHANNEL_ID:
                 await ctx.send(f"❌ Submit only in <#{SUBMIT_CHANNEL_ID}>.")
                 return
 
-        # Cooldown
         uid = ctx.author.id
-        now = time.monotonic()
-        last = USER_LAST_SUBMIT.get(uid, 0.0)
-        if (now - last) < SUBMIT_COOLDOWN_SEC:
-            wait = int(SUBMIT_COOLDOWN_SEC - (now - last))
-            await ctx.send(f"⏳ Cooldown: wait `{wait}s` before submitting again.")
-            return
-        USER_LAST_SUBMIT[uid] = now
-
         state = load_state()
+        rem = cooldown_remaining_sec(state, uid)
+        if rem > 0:
+            await ctx.send(f"⏳ Cooldown: wait `{rem}s` before submitting again.")
+            return
+
         date_str = today_str_ph()
         problem = state.get("problems_by_date", {}).get(date_str)
         if not problem:
@@ -882,43 +1126,44 @@ async def submit(ctx: commands.Context):
             return
 
         msg: discord.Message = ctx.message
-
-        code = await read_attachment_code(msg)
+        code, parse_err = await extract_submission_code(msg)
+        if parse_err:
+            await ctx.send(f"❌ {parse_err}")
+            return
         if not code:
-            code = extract_cpp_from_message(msg.content)
-
-        if not code:
-            await ctx.send("❌ I didn't find C++ code. Paste it inside a ```cpp``` block or attach a .cpp file.")
+            await ctx.send(f"❌ {ERR_NO_CODE}: No code payload found.")
             return
 
-        # Code size limit
         if len(code.encode("utf-8", errors="ignore")) > MAX_CODE_BYTES:
-            await ctx.send(f"❌ Code too large. Limit is {MAX_CODE_BYTES} bytes.")
+            await ctx.send(f"❌ {ERR_CODE_TOO_LARGE}: Code too large. Limit is {MAX_CODE_BYTES} bytes.")
             return
 
-        # Prompt warnings (common)
         if re.search(r'cout\s*<<\s*".*(enter|input|please)', code, flags=re.IGNORECASE):
             await ctx.send("⚠️ Heads up: prompts like `Enter n:` often cause Wrong Answer. Output should be answer only.")
 
-        # Skill enforcement
         if ENFORCE_SKILLS:
-            ok_skill, skill_msg = enforce_skill(problem, code)
-            if not ok_skill:
-                await ctx.send(skill_msg + "\n(Teacher: set `ENFORCE_SKILLS=false` to disable enforcement.)")
+            ok_skill, skill_msg, confidence = enforce_skill(problem, code)
+            if not ok_skill and confidence >= SKILL_HARD_FAIL_CONFIDENCE:
+                await ctx.send(skill_msg + f"\n(Confidence: {confidence:.2f}. Teacher: set `ENFORCE_SKILLS=false` to disable enforcement.)")
                 return
+            if not ok_skill and confidence >= SKILL_WARN_CONFIDENCE:
+                await ctx.send(f"⚠️ Skill-check warning (confidence {confidence:.2f}): {skill_msg}")
 
         tests = problem.get("tests", [])
         status_msg = await ctx.send("🧪 Compiling...")
+        JUDGE_METRICS["submissions"] += 1
 
         with tempfile.TemporaryDirectory(prefix="cs1judge_") as workdir:
             ok, cerr = await compile_cpp(code, workdir)
             if not ok:
                 cerr = cerr.strip()
-                USER_LAST_COMPILE_ERR[uid] = cerr
-                short = cerr
-                if len(short) > 1800:
-                    short = short[:1800] + "\n... (truncated)"
-                await status_msg.edit(content="❌ Compilation Error")
+                record_compile_error(state, uid, cerr)
+                JUDGE_METRICS["compile_errors"] += 1
+                set_cooldown(state, uid, COOLDOWN_AFTER_FAIL_SEC)
+                score_submission(state, uid, str(ctx.author), accepted=False, date_str=date_str)
+                save_state(state)
+                short = cerr[:1800] + ("\n... (truncated)" if len(cerr) > 1800 else "")
+                await status_msg.edit(content=f"❌ {ERR_COMPILE_FAIL}: Compilation Error")
                 await ctx.send(f"```text\n{short}\n```")
                 return
 
@@ -928,16 +1173,27 @@ async def submit(ctx: commands.Context):
                 await status_msg.edit(content=f"🏃 Running tests ({i}/{len(tests)})...")
                 passed, verdict, details = await run_one_test(workdir, t)
                 if not passed:
-                    await status_msg.edit(content=f"❌ {verdict} — failed test #{i}")
+                    kind = (details or {}).get("kind")
+                    if kind == "wa":
+                        JUDGE_METRICS["wrong_answers"] += 1
+                    elif kind == "runtime":
+                        JUDGE_METRICS["runtime_errors"] += 1
+                    elif kind == "timeout":
+                        JUDGE_METRICS["timeouts"] += 1
+                    elif kind == "output_limit":
+                        JUDGE_METRICS["output_limit_exceeded"] += 1
 
+                    set_cooldown(state, uid, COOLDOWN_AFTER_FAIL_SEC)
+                    score_submission(state, uid, str(ctx.author), accepted=False, date_str=date_str)
+                    save_state(state)
+
+                    await status_msg.edit(content=f"❌ {verdict} — failed test #{i}")
                     tinp = details["test"]["inp"] if details and "test" in details else ""
 
-                    if verdict == "Wrong Answer" and details:
+                    if "Wrong Answer" in verdict and details:
                         exp = details["expected"]
                         got = details["got"]
-
                         line_no, e_line, g_line = first_mismatch_line(exp, got)
-
                         msg_out = (
                             f"**Input**\n```text\n{clamp_block(tinp, 900)}```"
                             f"**Expected**\n```text\n{clamp_block(exp, 900)}```"
@@ -951,6 +1207,10 @@ async def submit(ctx: commands.Context):
                             await ctx.send(f"**Input**\n```text\n{clamp_block(tinp, 1200)}```")
                     return
 
+            JUDGE_METRICS["accepted"] += 1
+            set_cooldown(state, uid, COOLDOWN_AFTER_ACCEPT_SEC)
+            score_submission(state, uid, str(ctx.author), accepted=True, date_str=date_str)
+            save_state(state)
             await status_msg.edit(content=f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.")
             await ctx.send(f"Problem: **{problem['title']}** (Day {problem['day']})")
 
@@ -1131,8 +1391,11 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
             return
 
         msg: discord.Message = ctx.message
-        code = await read_attachment_code(msg) or extract_cpp_from_message(msg.content)
+        code, parse_err = await extract_submission_code(msg)
 
+        if parse_err:
+            await ctx.send(f"❌ {parse_err}")
+            return
         if not code:
             await ctx.send("❌ No C++ code found in message or attachment.")
             return
@@ -1143,10 +1406,12 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
             return
 
         if ENFORCE_SKILLS:
-            ok_skill, skill_msg = enforce_skill(problem, code)
-            if not ok_skill:
-                await ctx.send("[DEV] " + skill_msg)
+            ok_skill, skill_msg, confidence = enforce_skill(problem, code)
+            if not ok_skill and confidence >= SKILL_HARD_FAIL_CONFIDENCE:
+                await ctx.send("[DEV] " + skill_msg + f" (confidence={confidence:.2f})")
                 return
+            if not ok_skill and confidence >= SKILL_WARN_CONFIDENCE:
+                await ctx.send(f"[DEV] warning confidence={confidence:.2f}: {skill_msg}")
 
         async with SUBMIT_LOCK:
             status_msg = await ctx.send("🧪 [DEV] Compiling...")
@@ -1196,11 +1461,22 @@ async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, 
 # STARTUP CHECKS
 # =========================
 def _die(msg: str) -> None:
-    raise RuntimeError(msg)
+    raise RuntimeError(f"{ERR_CONFIG}: {msg}")
 
-if not TOKEN:
-    _die("DISCORD_TOKEN env var missing. Set DISCORD_TOKEN before running.")
-if DAILY_CHANNEL_ID == 0:
-    _die("DAILY_CHANNEL_ID env var missing. Set DAILY_CHANNEL_ID before running.")
 
-bot.run(TOKEN)
+def validate_config() -> None:
+    if not TOKEN:
+        _die("DISCORD_TOKEN env var missing. Set DISCORD_TOKEN before running.")
+    if DAILY_CHANNEL_ID == 0:
+        _die("DAILY_CHANNEL_ID env var missing. Set DAILY_CHANNEL_ID before running.")
+    if COMPILE_TIMEOUT_SEC <= 0 or RUN_TIMEOUT_SEC <= 0:
+        _die("Timeout values must be positive integers.")
+    if MAX_CODE_BYTES <= 0:
+        _die("MAX_CODE_BYTES must be > 0.")
+    if not (shutil.which(GPP) or os.path.exists(GPP)):
+        logging.warning("%s: GPP binary not found on startup: %s", ERR_CONFIG, GPP)
+
+
+if __name__ == "__main__":
+    validate_config()
+    bot.run(TOKEN)
