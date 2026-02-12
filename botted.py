@@ -78,6 +78,9 @@ SUBMIT_COOLDOWN_SEC = int(os.getenv("SUBMIT_COOLDOWN_SEC", "15"))
 # Toggle skill enforcement quickly if you need to
 ENFORCE_SKILLS = os.getenv("ENFORCE_SKILLS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 
+# Tutor mode: allow more explicit guidance on hint3/3. Default is hints-only.
+TUTOR_FULL_CODE = os.getenv("TUTOR_FULL_CODE", "false").strip().lower() in ("1", "true", "yes", "y", "on")
+
 # Admin roles list (comma-separated). If empty, fall back to "Root Admin".
 ADMIN_ROLES = [r.strip() for r in os.getenv("ADMIN_ROLES", "Root Admin").split(",") if r.strip()]
 
@@ -276,6 +279,89 @@ def clamp_block(s: str, limit: int = 1200) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + "\n... (truncated)\n"
+
+
+# =========================
+# TUTOR HELPERS (based on today's stored problem)
+# =========================
+def get_today_problem_from_state() -> Optional[dict]:
+    state = load_state()
+    date_str = today_str_ph()
+    return state.get("problems_by_date", {}).get(date_str)
+
+def _hint_bank(problem: dict) -> Dict[str, List[str]]:
+    """
+    Returns progressive hints for the current problem.
+    - If we know the exact problem id, you can extend this easily.
+    - Otherwise fall back to family-based hints.
+    """
+    fam = str(problem.get("family", "")).lower()
+    pid = str(problem.get("id", "")).upper()
+
+    by_id: Dict[str, List[str]] = {
+        # Example: add specific ones later if you want.
+        # "AB_COUNT_EVEN": ["...", "...", "..."],
+    }
+
+    if pid in by_id:
+        return {pid: by_id[pid]}
+
+    by_family: Dict[str, List[str]] = {
+        "arrays_basic": [
+            "Read **n**, then read **n numbers**. Store them in an array/vector so you can process them using `a[i]`.",
+            "Use a loop to fill `vector<long long> a(n)`, then another loop to compute the answer (count/sum/max/etc.).",
+            "Structure: `vector<long long> a(n); for i: cin>>a[i];` then process with `a[i]`.\n"
+            + ("(If your teacher allows: you can combine reading+processing, but here you should still store first.)" if not TUTOR_FULL_CODE else "")
+        ],
+        "arrays_nested": [
+            "This one usually needs **nested loops** (a loop inside a loop) + an array/matrix.",
+            "If it's a 2D style task: store inputs, then use `for (i) for (j)` to compute the required value.",
+            "Look for the pattern: outer loop = rows/first index, inner loop = columns/second index. Avoid `map`/`unordered_map`."
+        ],
+        "bool_checks": [
+            "Use comparisons (`<`, `>`, `==`, `!=`, etc.) and output the required boolean/decision result.",
+            "Keep it simple: compute a condition, store in `bool ok`, then print the required output format.",
+            "Common pattern: `bool ok = (condition);` then print `1/0` or `YES/NO` depending on the problem statement."
+        ],
+        "functions": [
+            "Your instructor wants a **user-defined function** besides `main()`.",
+            "Write a function that does the core work (sum/count/max/etc.), then call it from `main()` and print the result.",
+            "Skeleton: `returnType fn(params){ ... }` then in `main`: read input → call `fn(...)` → print."
+        ],
+        "patterns": [
+            "Patterns are about **loops + printing**. Don't store huge data; just print line by line.",
+            "Identify rows and columns. Usually outer loop controls rows, inner loop prints characters for that row.",
+            "Start with a small example: simulate row 1..n. Use `cout` inside loops, and print `\\n` per row."
+        ],
+        "strings": [
+            "Use `string` / `getline` as required. Read input carefully (line vs token).",
+            "If processing characters: loop through the string and apply conditions (`isalpha`, `isdigit`, etc.).",
+            "Remember: `getline(cin, s)` reads spaces; `cin >> s` does not."
+        ],
+        "math_logic": [
+            "Use arithmetic operators and/or loops based on the task (digits, primes, gcd, etc.).",
+            "Write the formula first, then implement it carefully. Watch for integer division.",
+            "Test with small numbers, then check edge cases (0, negatives if allowed, big values)."
+        ],
+        "recursion": [
+            "This problem requires a **recursive function** (it calls itself).",
+            "Define a clear base case that stops recursion. Then write the recursive step that reduces the problem size.",
+            "Template: `f(n) = ... f(n-1)` with base case like `n==0`/`n==1`."
+        ],
+        "stl_intro": [
+            "Use STL containers/algorithms (vector, set, map, sort, etc.) as required.",
+            "Prefer `vector` + `sort` for ordering tasks. For frequency, consider `map`/`unordered_map`.",
+            "Keep it standard: include `<bits/stdc++.h>` and use `std::` or `using namespace std;`."
+        ],
+    }
+
+    return {fam: by_family.get(fam, ["Read the problem carefully.", "Follow the input/output format exactly.", "Test using the sample I/O."])}
+
+def tutor_hints(problem: dict) -> List[str]:
+    bank = _hint_bank(problem)
+    # return the first (and only) list in the dict
+    return next(iter(bank.values()))
+
 
 # =========================
 # SKILL ENFORCEMENT (heuristics)
@@ -577,6 +663,103 @@ async def rules(ctx: commands.Context):
 async def format_cmd(ctx: commands.Context):
     await rules(ctx)
 
+
+# =========================
+# TUTOR COMMANDS (based on today's problem)
+# =========================
+@bot.command(name="explain")
+async def explain_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    fam = str(p.get("family", "")).lower()
+    if fam.startswith("arrays"):
+        await ctx.send("🧠 **Arrays topic**: store input values in an array/vector and process using indexing like `a[i]`.")
+    elif fam == "functions":
+        await ctx.send("🧠 **Functions topic**: define at least one user-defined function (besides `main`) and call it from `main()`.")
+    elif fam == "recursion":
+        await ctx.send("🧠 **Recursion topic**: create a function that calls itself with a smaller input, with a clear base case.")
+    elif fam == "strings":
+        await ctx.send("🧠 **Strings topic**: use `string` / `getline` and process characters carefully (spaces vs tokens).")
+    elif fam == "patterns":
+        await ctx.send("🧠 **Patterns topic**: use loops to print output line-by-line; outer loop = rows, inner loop = columns.")
+    elif fam == "stl_intro":
+        await ctx.send("🧠 **STL topic**: use STL containers/algorithms like `vector`, `sort`, `set`, `map` as required.")
+    else:
+        await ctx.send(f"🧠 Topic: **{fam}**. Follow the input/output format and apply the required concept.")
+
+@bot.command(name="approach")
+async def approach_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    fam = str(p.get("family", "")).lower()
+    steps = []
+    steps.append("1) Read input exactly as specified.")
+    if fam == "arrays_basic":
+        steps += ["2) Store the n values in `vector<long long> a(n)`.", "3) Loop through `a[i]` to compute the required result.", "4) Print the result only (no prompts)."]
+    elif fam == "arrays_nested":
+        steps += ["2) Store the data (often 2D / multiple values).", "3) Use nested loops (`for` inside `for`) to compute.", "4) Print result only."]
+    elif fam == "functions":
+        steps += ["2) Write a helper function that solves the core task.", "3) Call it from `main()` and print the return value."]
+    elif fam == "recursion":
+        steps += ["2) Identify base case.", "3) Write recursive step reducing the problem size.", "4) Call the recursive function and print the result."]
+    else:
+        steps += ["2) Use the required topic tools (see `!explain`).", "3) Match output format exactly."]
+    await ctx.send("🧩 **Approach (today's problem)**\n" + "\n".join(steps))
+
+@bot.command(name="hint")
+async def hint_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    await ctx.send("💡 " + tutor_hints(p)[0])
+
+@bot.command(name="hint2")
+async def hint2_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    hints = tutor_hints(p)
+    await ctx.send("💡 " + (hints[1] if len(hints) > 1 else hints[0]))
+
+@bot.command(name="hint3")
+async def hint3_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    hints = tutor_hints(p)
+    msg = hints[2] if len(hints) > 2 else hints[-1]
+    if TUTOR_FULL_CODE:
+        msg += "\n\n✅ *(Tutor mode)* `TUTOR_FULL_CODE=true` is enabled, so hints may be more explicit."
+    await ctx.send("💡 " + msg)
+
+@bot.command(name="dryrun")
+async def dryrun_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    await ctx.send(
+        "🧪 **Sample Dry Run**\n"
+        f"**Sample Input**\n```text\n{p.get('sample_in','')}```"
+        f"**Sample Output**\n```text\n{p.get('sample_out','')}```"
+        "Try to reproduce the sample output exactly."
+    )
+
+@bot.command(name="constraints")
+async def constraints_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    await ctx.send(f"📌 **Constraints**\n{p.get('constraints','-')}")
+
 # =========================
 # ADMIN COMMANDS
 # =========================
@@ -721,7 +904,7 @@ async def submit(ctx: commands.Context):
         if ENFORCE_SKILLS:
             ok_skill, skill_msg = enforce_skill(problem, code)
             if not ok_skill:
-                await ctx.send(skill_msg + "\n(Mark: set `ENFORCE_SKILLS=false` to disable enforcement.)")
+                await ctx.send(skill_msg + "\n(Teacher: set `ENFORCE_SKILLS=false` to disable enforcement.)")
                 return
 
         tests = problem.get("tests", [])
@@ -1021,4 +1204,3 @@ if DAILY_CHANNEL_ID == 0:
     _die("DAILY_CHANNEL_ID env var missing. Set DAILY_CHANNEL_ID before running.")
 
 bot.run(TOKEN)
-
