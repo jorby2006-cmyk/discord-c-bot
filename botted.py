@@ -549,11 +549,11 @@ async def submit(ctx: commands.Context):
             await ctx.send("⚠️ Heads up: prompts like `Enter n:` usually cause Wrong Answer. Output should be answer only.")
 
 
-        # ✅ ENFORCE REQUIRED SKILL CATEGORY (heuristics)
-        ok_skill, skill_msg = enforce_skill(problem, code)
-        if not ok_skill:
-            await ctx.send(skill_msg)
-            return
+# ✅ ENFORCE REQUIRED SKILL CATEGORY (heuristics)
+ok_skill, skill_msg = enforce_skill(problem, code)
+if not ok_skill:
+    await ctx.send(skill_msg)
+    return
 
         tests = problem.get("tests", [])
         status_msg = await ctx.send("🧪 Compiling...")
