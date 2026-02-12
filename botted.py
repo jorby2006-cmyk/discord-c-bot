@@ -721,7 +721,7 @@ async def submit(ctx: commands.Context):
         if ENFORCE_SKILLS:
             ok_skill, skill_msg = enforce_skill(problem, code)
             if not ok_skill:
-                await ctx.send(skill_msg + "\n(Teacher: set `ENFORCE_SKILLS=false` to disable enforcement.)")
+                await ctx.send(skill_msg + "\n(Mark: set `ENFORCE_SKILLS=false` to disable enforcement.)")
                 return
 
         tests = problem.get("tests", [])
@@ -1021,3 +1021,4 @@ if DAILY_CHANNEL_ID == 0:
     _die("DAILY_CHANNEL_ID env var missing. Set DAILY_CHANNEL_ID before running.")
 
 bot.run(TOKEN)
+
