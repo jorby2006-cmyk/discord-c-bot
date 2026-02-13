@@ -73,6 +73,11 @@ COOLDOWN_AFTER_FAIL_SEC = int(os.getenv("COOLDOWN_AFTER_FAIL_SEC", str(SUBMIT_CO
 ENFORCE_SKILLS = os.getenv("ENFORCE_SKILLS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 TUTOR_FULL_CODE = os.getenv("TUTOR_FULL_CODE", "false").strip().lower() in ("1", "true", "yes", "y", "on")
 
+# If you want "strict arrays" (require actual array/vector declaration) set true.
+STRICT_ARRAYS = os.getenv("STRICT_ARRAYS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+# If you want "strict functions" (require helper besides main, not lambda) set true.
+STRICT_FUNCTIONS = os.getenv("STRICT_FUNCTIONS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+
 ADMIN_ROLES = [r.strip() for r in os.getenv("ADMIN_ROLES", "Root Admin").split(",") if r.strip()]
 
 # g++ command
@@ -104,11 +109,11 @@ ERR_RUNTIME = "JDG202"
 ERR_WRONG_ANSWER = "JDG203"
 ERR_OUTPUT_LIMIT = "JDG204"
 
-SKILL_HARD_FAIL_CONFIDENCE = float(os.getenv("SKILL_HARD_FAIL_CONFIDENCE", "0.75"))
-SKILL_WARN_CONFIDENCE = float(os.getenv("SKILL_WARN_CONFIDENCE", "0.45"))
+SKILL_HARD_FAIL_CONFIDENCE = float(os.getenv("SKILL_HARD_FAIL_CONFIDENCE", "0.90"))
+SKILL_WARN_CONFIDENCE = float(os.getenv("SKILL_WARN_CONFIDENCE", "0.60"))
 HINTS_PER_DAY_LIMIT = int(os.getenv("HINTS_PER_DAY_LIMIT", "5"))
 
-BOT_UPDATES_VERSION = "2026-02-checkers-hardened-no-manual-random"
+BOT_UPDATES_VERSION = "2026-02-strict-skillchecks-fixed-regex-flags"
 
 # =========================
 # DISCORD BOT SETUP
@@ -356,8 +361,6 @@ def generate_problem(day_index: int, date_str: str) -> dict:
     family = pick_family(day_index)
     kind = pick_kind_for_family(family, seed)
 
-    # NOTE: generators are expected to use rng deterministically if they do internal randomness.
-    # We keep their RNG deterministic too, but "random" is not exposed as a manual admin command anymore.
     rng = __import__("random").Random(seed)
 
     try:
@@ -583,7 +586,7 @@ def tutor_hints(problem: dict) -> List[str]:
 
 
 # =========================
-# SKILL ENFORCEMENT (hardened heuristics)
+# SKILL ENFORCEMENT (STRICT)
 # =========================
 _STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
 _CHAR_RE = re.compile(r"'(?:\\.|[^'\\])*'")
@@ -593,7 +596,7 @@ _LINE_COMMENT_RE = re.compile(r"//.*?$", re.MULTILINE)
 
 def _strip_cpp_comments_and_strings(code: str) -> str:
     """
-    Safer order:
+    Order matters:
     1) replace strings/chars so '//' inside them won't get treated as a comment
     2) remove /* */ block comments
     3) remove // line comments
@@ -608,46 +611,46 @@ def _strip_cpp_comments_and_strings(code: str) -> str:
 
 
 def _has_user_defined_function(code: str) -> bool:
-    code = _strip_cpp_comments_and_strings(code)
+    """
+    True if there is a real function definition besides main.
+    IMPORTANT: regex flags must be at the start; use re.VERBOSE + re.MULTILINE.
+    """
+    c = _strip_cpp_comments_and_strings(code)
 
-    # Detect function definitions (not prototypes) by requiring '{' after signature.
-    # Works for: return_type name(args) { ... }
     fn_pat = re.compile(
         r"""
-        (?mx)
         ^\s*
         (?:template\s*<[^>]+>\s*)?
-        (?:static\s+|inline\s+|constexpr\s+|friend\s+)?
-        (?:[\w:\<\>\,\&\*\s]+?)\s+
+        (?:static\s+|inline\s+|constexpr\s+|friend\s+)?   # qualifiers
+        (?:[\w:\<\>\,\&\*\s]+?)\s+                       # return type
         (?P<name>[A-Za-z_]\w*)
-        \s*\([^;{}]*\)
+        \s*\([^;{}]*\)                                   # args
         \s*(?:const\s*)?
         (?:noexcept\s*)?
         \{
         """,
+        re.MULTILINE | re.VERBOSE,
     )
-    for m in fn_pat.finditer(code):
+    for m in fn_pat.finditer(c):
         if m.group("name") != "main":
             return True
     return False
 
 
-def _has_array_usage(code: str) -> bool:
+def _has_array_declaration(code: str) -> bool:
     """
-    Fix: detect C-style arrays even with initializers:
-      int a[n] = {};
-      long long a[100] = {0};
-    And detect vector/array + indexing patterns robustly.
+    Must detect real array declarations:
+    - vector<T> a;
+    - array<T, N> a;
+    - T a[N];
     """
-    code = _strip_cpp_comments_and_strings(code)
+    c = _strip_cpp_comments_and_strings(code)
 
-    has_vector = bool(re.search(r"\b(?:std::)?vector\s*<", code))
-    has_std_array = bool(re.search(r"\b(?:std::)?array\s*<", code))
+    has_vector = bool(re.search(r"\b(?:std::)?vector\s*<", c))
+    has_std_array = bool(re.search(r"\b(?:std::)?array\s*<", c))
 
-    # More permissive type head (supports unsigned/long long/etc.)
     c_array_decl = re.compile(
         r"""
-        (?x)
         \b
         (?:
             (?:unsigned\s+)?(?:long\s+long|long|int|short|char|bool) |
@@ -661,90 +664,82 @@ def _has_array_usage(code: str) -> bool:
         \s*\[\s*[^\]]+\s*\]
         \s*(?:=\s*[^;]*)?
         \s*;
-        """
+        """,
+        re.VERBOSE,
     )
-    has_c_array_decl = bool(c_array_decl.search(code))
+    has_c_array_decl = bool(c_array_decl.search(c))
+    return has_vector or has_std_array or has_c_array_decl
 
-    # Indexing / access
-    has_bracket_index = bool(re.search(r"\b[_A-Za-z]\w*\s*\[\s*[^\]]+\s*\]", code))
-    has_at = bool(re.search(r"\.\s*at\s*\(", code))
 
-    # If they declared an array, we accept even if they don't index it (arrays_basic should be less annoying).
-    # For arrays_nested, nested-loop check still exists.
-    return (has_vector or has_std_array or has_c_array_decl) and (has_bracket_index or has_at or has_c_array_decl)
+def _has_array_indexing_or_loop_over_n(code: str) -> bool:
+    c = _strip_cpp_comments_and_strings(code)
+    # some access signal
+    has_bracket_index = bool(re.search(r"\b[_A-Za-z]\w*\s*\[\s*[^\]]+\s*\]", c))
+    has_at = bool(re.search(r"\.\s*at\s*\(", c))
+    # a very common CS1 pattern: read n, loop n times
+    looks_like_read_n_loop = bool(
+        re.search(r"\bcin\s*>>\s*[_A-Za-z]\w*\s*;", c) and re.search(r"\bfor\s*\(", c)
+    )
+    return has_bracket_index or has_at or looks_like_read_n_loop
 
 
 def _has_nested_loops(code: str) -> bool:
-    code = _strip_cpp_comments_and_strings(code)
-    # Don't try to prove perfect nesting; we want to avoid false negatives.
-    # A practical signal: a loop appears inside a brace block that also contains another loop.
-    # Fallback: at least two loops anywhere.
-    if len(re.findall(r"\bfor\b|\bwhile\b", code)) < 2:
+    c = _strip_cpp_comments_and_strings(code)
+    if len(re.findall(r"\bfor\b|\bwhile\b", c)) < 2:
         return False
     pat = re.compile(r"(for|while)\s*\([^\)]*\)\s*\{[\s\S]{0,5000}?(for|while)\s*\(", re.MULTILINE)
-    return bool(pat.search(code))
+    return bool(pat.search(c))
 
 
 def _has_bool_logic(code: str) -> bool:
-    code = _strip_cpp_comments_and_strings(code)
-    return bool(re.search(r"\bbool\b|\btrue\b|\bfalse\b|==|!=|<=|>=|<|>", code))
+    c = _strip_cpp_comments_and_strings(code)
+    return bool(re.search(r"\bbool\b|\btrue\b|\bfalse\b|==|!=|<=|>=|<|>", c))
 
 
 def _has_string_usage(code: str) -> bool:
-    code = _strip_cpp_comments_and_strings(code)
-    return bool(re.search(r"\b(?:std::)?string\b|\b(?:std::)?wstring\b|getline\s*\(", code))
+    c = _strip_cpp_comments_and_strings(code)
+    return bool(re.search(r"\b(?:std::)?string\b|\b(?:std::)?wstring\b|getline\s*\(", c))
 
 
 def _has_pattern_printing(code: str) -> bool:
-    code = _strip_cpp_comments_and_strings(code)
-    has_loop = bool(re.search(r"\bfor\b|\bwhile\b", code))
-    uses_cout = "cout" in code
-    # don't require '*' or '#': many patterns print digits/letters/spaces
-    prints_something = bool(re.search(r"\bcout\s*<<", code))
-    return has_loop and uses_cout and prints_something
+    c = _strip_cpp_comments_and_strings(code)
+    has_loop = bool(re.search(r"\bfor\b|\bwhile\b", c))
+    prints_something = bool(re.search(r"\bcout\s*<<", c))
+    return has_loop and prints_something
 
 
 def _has_math_logic_ops(code: str) -> bool:
-    code = _strip_cpp_comments_and_strings(code)
-    # include common math functions too
-    return bool(
-        re.search(
-            r"%|\bsqrt\s*\(|\babs\s*\(|\bpow\s*\(|/|\*|\+|-|\bmin\s*\(|\bmax\s*\(",
-            code,
-        )
-    )
+    c = _strip_cpp_comments_and_strings(code)
+    return bool(re.search(r"%|\bsqrt\s*\(|\babs\s*\(|\bpow\s*\(|/|\*|\+|-|\bmin\s*\(|\bmax\s*\(", c))
 
 
 def _has_recursion(code: str) -> bool:
-    code = _strip_cpp_comments_and_strings(code)
+    c = _strip_cpp_comments_and_strings(code)
 
-    # Find function definitions (avoid prototypes)
     fn_pat = re.compile(
         r"""
-        (?mx)
         ^\s*
         (?:template\s*<[^>]+>\s*)?
-        (?:static\s+|inline\s+|constexpr\s+)?
-        (?:[\w:\<\>\,\&\*\s]+?)\s+
+        (?:static\s+|inline\s+|constexpr\s+)?            # qualifiers
+        (?:[\w:\<\>\,\&\*\s]+?)\s+                       # return type
         (?P<name>[A-Za-z_]\w*)
         \s*\([^;{}]*\)
         \s*(?:const\s*)?
         (?:noexcept\s*)?
         \{
         """,
+        re.MULTILINE | re.VERBOSE,
     )
-    names = [m.group("name") for m in fn_pat.finditer(code) if m.group("name") != "main"]
+    names = [m.group("name") for m in fn_pat.finditer(c) if m.group("name") != "main"]
     for n in names:
-        # definition counts once; recursion needs at least one additional call
-        # Use word boundary to avoid matching substrings.
-        calls = len(re.findall(rf"\b{re.escape(n)}\s*\(", code))
+        calls = len(re.findall(rf"\b{re.escape(n)}\s*\(", c))
         if calls >= 2:
             return True
     return False
 
 
 def _has_stl_usage(code: str) -> bool:
-    code = _strip_cpp_comments_and_strings(code)
+    c = _strip_cpp_comments_and_strings(code)
     return bool(
         re.search(
             r"\b(?:std::)?vector\s*<"
@@ -755,7 +750,7 @@ def _has_stl_usage(code: str) -> bool:
             r"|\b(?:std::)?unique\s*\("
             r"|\b(?:std::)?lower_bound\s*\("
             r"|\b(?:std::)?upper_bound\s*\(",
-            code,
+            c,
         )
     )
 
@@ -764,51 +759,48 @@ def enforce_skill(problem: dict, code: str) -> Tuple[bool, str, float]:
     fam = str(problem.get("family", "")).lower()
 
     if fam == "arrays_basic":
-        # Hardened: accept C-array declarations with initializers, vectors, etc.
-        # Also accept "read n + loop n times" in case teacher allows not storing.
-        if not _has_array_usage(code):
-            c = _strip_cpp_comments_and_strings(code)
-            looks_like_read_n_loop = bool(
-                re.search(r"\bcin\s*>>\s*[_A-Za-z]\w*\s*;", c) and re.search(r"\bfor\s*\(", c)
-            )
-            if not looks_like_read_n_loop:
-                return False, "❌ **ARRAYS (basic)**: I didn’t detect arrays/vectors OR a typical `read n + loop n times` structure.", 0.70
+        # STRICT: require a real array/vector declaration (not just loop).
+        if STRICT_ARRAYS and not _has_array_declaration(code):
+            return False, "❌ **ARRAYS (basic)**: You must declare an array/vector (e.g., `int a[n];` or `vector<int> a(n);`).", 0.99
+        # also require some use (indexing OR read-n loop)
+        if not _has_array_indexing_or_loop_over_n(code):
+            return False, "❌ **ARRAYS (basic)**: I didn’t detect array indexing (e.g., `a[i]`) or a typical `read n + loop n times` structure.", 0.95
 
     elif fam == "arrays_nested":
-        if not _has_array_usage(code):
-            return False, "❌ **ARRAYS (nested)**: I didn’t detect array/vector + indexing (or array declaration).", 0.80
+        if not _has_array_declaration(code):
+            return False, "❌ **ARRAYS (nested)**: You must declare an array/vector/matrix (no maps).", 0.99
         if not _has_nested_loops(code):
-            return False, "❌ **ARRAYS (nested)**: I didn’t detect **nested loops** (e.g., `for` inside `for`).", 0.75
+            return False, "❌ **ARRAYS (nested)**: You must use **nested loops** (e.g., `for` inside `for`).", 0.98
         if re.search(r"\bunordered_map\b|\bmap\b", _strip_cpp_comments_and_strings(code)):
-            return False, "❌ **ARRAYS (nested)**: `map`/`unordered_map` not allowed. Use loops as required.", 0.95
+            return False, "❌ **ARRAYS (nested)**: `map`/`unordered_map` not allowed. Use arrays + loops.", 0.99
 
     elif fam == "bool_checks":
         if not _has_bool_logic(code):
-            return False, "❌ **BOOL CHECKS**: I didn’t detect boolean logic (`bool`, comparisons, true/false).", 0.55
+            return False, "❌ **BOOL CHECKS**: I didn’t detect boolean logic (`bool`, comparisons, true/false).", 0.90
 
     elif fam == "functions":
-        if not _has_user_defined_function(code):
-            return False, "❌ **FUNCTIONS**: Define at least one user-defined function (besides `main`).", 0.85
+        if STRICT_FUNCTIONS and not _has_user_defined_function(code):
+            return False, "❌ **FUNCTIONS**: Define at least one user-defined function (besides `main`) and use it.", 0.99
 
     elif fam == "patterns":
         if not _has_pattern_printing(code):
-            return False, "❌ **PATTERNS**: Use loops to print a pattern (`cout <<` inside loops).", 0.50
+            return False, "❌ **PATTERNS**: Use loops to print a pattern (`cout <<` inside loops).", 0.85
 
     elif fam == "strings":
         if not _has_string_usage(code):
-            return False, "❌ **STRINGS**: Use `string`/`std::string` or `getline`.", 0.60
+            return False, "❌ **STRINGS**: Use `string`/`std::string` or `getline`.", 0.90
 
     elif fam == "math_logic":
         if not _has_math_logic_ops(code):
-            return False, "❌ **MATH/LOGIC**: I didn’t detect typical math ops (arithmetic, %, sqrt/abs, etc.).", 0.40
+            return False, "❌ **MATH/LOGIC**: I didn’t detect typical math ops (arithmetic, %, sqrt/abs, etc.).", 0.80
 
     elif fam == "recursion":
         if not _has_recursion(code):
-            return False, "❌ **RECURSION**: I didn’t detect a recursive function (a function calling itself).", 0.90
+            return False, "❌ **RECURSION**: I didn’t detect a recursive function (a function calling itself).", 0.99
 
     elif fam == "stl_intro":
         if not _has_stl_usage(code):
-            return False, "❌ **STL INTRO**: Use STL (e.g., `vector`, `set`, `map`, or `sort`).", 0.75
+            return False, "❌ **STL INTRO**: Use STL (e.g., `vector`, `set`, `map`, or `sort`).", 0.90
 
     return True, "", 1.0
 
@@ -891,6 +883,12 @@ async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
     rc, out, err, _ = await run_subprocess(cmd, stdin_data=None, timeout_sec=COMPILE_TIMEOUT_SEC, cwd=workdir)
 
     if rc == 0 and os.path.exists(exe):
+        # Some Linux environments require execute bit.
+        if not IS_WINDOWS:
+            try:
+                os.chmod(exe, 0o755)
+            except Exception:
+                pass
         return True, ""
 
     if rc == -999:
@@ -1276,7 +1274,7 @@ if ENABLE_SLASH:
         steps = ["1) Read input exactly as specified."]
         if fam == "arrays_basic":
             steps += [
-                "2) If required, store values in `vector<long long> a(n)`.",
+                "2) Store values in an array/vector.",
                 "3) Loop through the values to compute the result.",
                 "4) Print the result only (no prompts).",
             ]
@@ -1400,6 +1398,7 @@ if ENABLE_SLASH:
             result_cb=result,
         )
 
+    # ---- SLASH: ADMIN ----
     @tree.command(name="status", description="Admin: show bot status/metrics")
     @slash_admin_only()
     async def slash_status(interaction: discord.Interaction):
@@ -1415,7 +1414,7 @@ if ENABLE_SLASH:
             "**Bot Status**\n"
             f"- Uptime: `{up}s`\n"
             f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` | ENABLE_SLASH: `{ENABLE_SLASH}`\n"
-            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
+            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}` (STRICT_ARRAYS={STRICT_ARRAYS}, STRICT_FUNCTIONS={STRICT_FUNCTIONS})\n"
             f"- Day index: `{di}`\n"
             f"- Today stored: `{stored}` ({date_str})\n"
             f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
@@ -1483,7 +1482,6 @@ if ENABLE_SLASH:
         st = load_state()
         date_str = today_str_ph()
 
-        # advance index explicitly
         di = int(st.get("day_index", 0))
         p = generate_problem(di, date_str)
 
@@ -1597,7 +1595,7 @@ if ENABLE_PREFIX:
         fam = str(p.get("family", "")).lower()
         steps = ["1) Read input exactly as specified."]
         if fam == "arrays_basic":
-            steps += ["2) If required, store values in an array/vector.", "3) Loop to compute the result.", "4) Print result only (no prompts)."]
+            steps += ["2) Store values in an array/vector.", "3) Loop to compute the result.", "4) Print result only (no prompts)."]
         elif fam == "arrays_nested":
             steps += ["2) Store the data.", "3) Use nested loops.", "4) Print result only."]
         elif fam == "functions":
@@ -1725,7 +1723,7 @@ if ENABLE_PREFIX:
             "**Bot Status**\n"
             f"- Uptime: `{up}s`\n"
             f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` | ENABLE_SLASH: `{ENABLE_SLASH}`\n"
-            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
+            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}` (STRICT_ARRAYS={STRICT_ARRAYS}, STRICT_FUNCTIONS={STRICT_FUNCTIONS})\n"
             f"- Day index: `{di}`\n"
             f"- Today stored: `{stored}` ({date_str})\n"
             f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
