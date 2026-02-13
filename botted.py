@@ -13,7 +13,7 @@ import subprocess
 import time
 import shutil
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Callable, Awaitable
 
 import discord
 from discord import app_commands
@@ -74,7 +74,6 @@ COOLDOWN_AFTER_FAIL_SEC = int(os.getenv("COOLDOWN_AFTER_FAIL_SEC", str(SUBMIT_CO
 ENFORCE_SKILLS = os.getenv("ENFORCE_SKILLS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 TUTOR_FULL_CODE = os.getenv("TUTOR_FULL_CODE", "false").strip().lower() in ("1", "true", "yes", "y", "on")
 
-# IMPORTANT: Your admin role is Root Admin
 ADMIN_ROLES = [r.strip() for r in os.getenv("ADMIN_ROLES", "Root Admin").split(",") if r.strip()]
 
 # g++ command
@@ -110,23 +109,28 @@ SKILL_HARD_FAIL_CONFIDENCE = float(os.getenv("SKILL_HARD_FAIL_CONFIDENCE", "0.75
 SKILL_WARN_CONFIDENCE = float(os.getenv("SKILL_WARN_CONFIDENCE", "0.45"))
 HINTS_PER_DAY_LIMIT = int(os.getenv("HINTS_PER_DAY_LIMIT", "5"))
 
-BOT_UPDATES_VERSION = "2026-02-revised-hybrid-POSTNOWFIX"
+BOT_UPDATES_VERSION = "2026-02-command-system-rewrite"
 
 # =========================
 # DISCORD BOT SETUP
 # =========================
 intents = discord.Intents.default()
-
-# Prefix commands require message_content intent to read messages.
-# NOTE: You must ALSO enable "Message Content Intent" in Discord Developer Portal.
+# Prefix commands need message_content to see messages
 intents.message_content = True
 
+# IMPORTANT: callable prefix prevents weird None behavior and makes logging/debug easier
+def _prefix_callable(_bot: commands.Bot, _message: discord.Message):
+    return COMMAND_PREFIX if ENABLE_PREFIX else "NO_PREFIX__"
+
 bot = commands.Bot(
-    command_prefix=(COMMAND_PREFIX if ENABLE_PREFIX else None),
+    command_prefix=_prefix_callable,
     intents=intents,
     help_command=None,
 )
 
+# =========================
+# PERMISSIONS / ADMIN
+# =========================
 def is_admin_member(member: discord.Member) -> bool:
     try:
         if member.guild_permissions.administrator:
@@ -136,6 +140,23 @@ def is_admin_member(member: discord.Member) -> bool:
     except Exception:
         return False
 
+def prefix_admin_only():
+    async def predicate(ctx: commands.Context) -> bool:
+        if not ctx.guild or not isinstance(ctx.author, discord.Member):
+            return False
+        return is_admin_member(ctx.author)
+    return commands.check(predicate)
+
+def slash_admin_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return False
+        return is_admin_member(interaction.user)
+    return app_commands.check(predicate)
+
+# =========================
+# TIME HELPERS
+# =========================
 def today_str_ph() -> str:
     return datetime.datetime.now(PH_TZ).date().isoformat()
 
@@ -420,7 +441,7 @@ def get_today_problem_from_state() -> Optional[dict]:
     date_str = today_str_ph()
     return st.get("problems_by_date", {}).get(date_str)
 
-def _hint_bank(problem: dict) -> Dict[str, List[str]]:
+def tutor_hints(problem: dict) -> List[str]:
     fam = str(problem.get("family", "")).lower()
     by_family: Dict[str, List[str]] = {
         "arrays_basic": [
@@ -469,11 +490,7 @@ def _hint_bank(problem: dict) -> Dict[str, List[str]]:
             "Make sure output formatting matches exactly."
         ],
     }
-    return {fam: by_family.get(fam, ["Read the problem carefully.", "Follow the I/O format exactly.", "Test using the sample I/O."])}
-
-def tutor_hints(problem: dict) -> List[str]:
-    bank = _hint_bank(problem)
-    return next(iter(bank.values()))
+    return by_family.get(fam, ["Read the problem carefully.", "Follow the I/O format exactly.", "Test using the sample I/O."])
 
 # =========================
 # SKILL ENFORCEMENT (heuristics)
@@ -758,7 +775,7 @@ def help_text() -> str:
             f"• `{COMMAND_PREFIX}help` • `{COMMAND_PREFIX}ping` • `{COMMAND_PREFIX}today` • `{COMMAND_PREFIX}submit` • `{COMMAND_PREFIX}rules`\n"
             f"• `{COMMAND_PREFIX}explain` • `{COMMAND_PREFIX}approach` • `{COMMAND_PREFIX}hint` • `{COMMAND_PREFIX}hint2` • `{COMMAND_PREFIX}hint3`\n"
             f"• `{COMMAND_PREFIX}dryrun` • `{COMMAND_PREFIX}constraints` • `{COMMAND_PREFIX}leaderboard`\n"
-            f"• `{COMMAND_PREFIX}whoami` (debug)\n\n"
+            f"• `{COMMAND_PREFIX}whoami` • `{COMMAND_PREFIX}whotest`\n\n"
             f"**Prefix (Admin)**\n"
             f"• `{COMMAND_PREFIX}status` • `{COMMAND_PREFIX}postnow` • `{COMMAND_PREFIX}reset_today` • `{COMMAND_PREFIX}regen_today` • `{COMMAND_PREFIX}repost_date YYYY-MM-DD`\n"
             f"• `{COMMAND_PREFIX}dev help|list|random [family]|pick <family> <kind>|setup`\n"
@@ -796,9 +813,10 @@ async def judge_submission(
     channel_id: int,
     code_text: Optional[str],
     attachment: Optional[discord.Attachment],
-    progress_cb,   # async callable(str)
-    result_cb      # async callable(str)
+    progress_cb: Callable[[str], Awaitable[None]],
+    result_cb: Callable[[str], Awaitable[None]],
 ) -> None:
+    # channel restriction
     if SUBMIT_CHANNEL_ID and channel_id != SUBMIT_CHANNEL_ID:
         if SUBMIT_CHANNEL_ID != DAILY_CHANNEL_ID:
             await result_cb(f"❌ Submit only in <#{SUBMIT_CHANNEL_ID}>.")
@@ -909,17 +927,48 @@ async def judge_submission(
             await result_cb(f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.\nProblem: **{problem['title']}** (Day {problem['day']})")
 
 # =========================
+# COMMAND SYSTEM FIXES
+# =========================
+@bot.event
+async def on_message(message: discord.Message):
+    """
+    ✅ If you define on_message, you MUST call bot.process_commands
+    otherwise ALL prefix commands stop working.
+    """
+    if message.author.bot:
+        return
+
+    content = (message.content or "").strip()
+    if ENABLE_PREFIX and content == f"{COMMAND_PREFIX}whotest":
+        try:
+            await message.channel.send("✅ I can see messages here (prefix alive).")
+        except discord.Forbidden:
+            logging.warning("Forbidden: cannot send in channel=%s", getattr(message.channel, "id", None))
+
+    await bot.process_commands(message)
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, CommandNotFound):
+        return
+
+    if isinstance(error, CheckFailure):
+        roles = [r.name for r in ctx.author.roles] if isinstance(ctx.author, discord.Member) else []
+        await ctx.send(
+            "❌ You don't have permission to use that command.\n"
+            f"Expected ADMIN_ROLES: `{ADMIN_ROLES}`\n"
+            f"Your roles: `{roles}`"
+        )
+        return
+
+    logging.exception("Command error: %s", error)
+    await ctx.send(f"❌ Command error: `{type(error).__name__}`")
+
+# =========================
 # SLASH COMMANDS
 # =========================
 if ENABLE_SLASH:
     tree = bot.tree
-
-    def admin_only():
-        async def predicate(interaction: discord.Interaction) -> bool:
-            if not interaction.guild or not isinstance(interaction.user, discord.Member):
-                return False
-            return is_admin_member(interaction.user)
-        return app_commands.check(predicate)
 
     @tree.command(name="help", description="Show all bot commands")
     async def slash_help(interaction: discord.Interaction):
@@ -954,6 +1003,125 @@ if ENABLE_SLASH:
     async def slash_format(interaction: discord.Interaction):
         await slash_rules(interaction)
 
+    @tree.command(name="explain", description="Explain today's topic")
+    async def slash_explain(interaction: discord.Interaction):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
+            return
+        fam = str(p.get("family", "")).lower()
+        mapping = {
+            "arrays_basic": "🧠 **Arrays**: store input values in an array/vector and process using indexing like `a[i]`.",
+            "arrays_nested": "🧠 **Arrays (nested)**: store data and use nested loops (`for` inside `for`).",
+            "functions": "🧠 **Functions**: define at least one user-defined function (besides `main`) and call it from `main()`.",
+            "recursion": "🧠 **Recursion**: create a function that calls itself with a smaller input, with a clear base case.",
+            "strings": "🧠 **Strings**: use `string` / `getline` and handle spaces vs tokens carefully.",
+            "patterns": "🧠 **Patterns**: use loops to print line-by-line; outer loop = rows, inner loop = columns.",
+            "stl_intro": "🧠 **STL**: use `vector`, `sort`, `set`, `map`, etc. as required.",
+        }
+        await send_ephemeral(interaction, mapping.get(fam, f"🧠 Topic: **{fam}**. Follow the input/output format and apply the required concept."))
+
+    @tree.command(name="approach", description="Suggested steps for today's MP")
+    async def slash_approach(interaction: discord.Interaction):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
+            return
+        fam = str(p.get("family", "")).lower()
+        steps = ["1) Read input exactly as specified."]
+        if fam == "arrays_basic":
+            steps += ["2) Store the n values in `vector<long long> a(n)`.","3) Loop through `a[i]` to compute the required result.","4) Print the result only (no prompts)."]
+        elif fam == "arrays_nested":
+            steps += ["2) Store the data (often 2D / multiple values).","3) Use nested loops (`for` inside `for`) to compute.","4) Print result only."]
+        elif fam == "functions":
+            steps += ["2) Write a helper function that solves the core task.","3) Call it from `main()` and print the return value."]
+        elif fam == "recursion":
+            steps += ["2) Identify base case.","3) Write recursive step reducing the problem size.","4) Call the recursive function and print the result."]
+        else:
+            steps += ["2) Use the required topic tools (see `/explain`).", "3) Match output format exactly."]
+        await send_ephemeral(interaction, "🧩 **Approach (today's problem)**\n" + "\n".join(steps))
+
+    @tree.command(name="hint", description="Get hint 1 (limited per day)")
+    async def slash_hint(interaction: discord.Interaction):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
+            return
+        st = load_state()
+        ok, used = consume_hint(st, interaction.user.id, today_str_ph())
+        if not ok:
+            await send_ephemeral(interaction, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
+            return
+        save_state(st)
+        await send_ephemeral(interaction, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {tutor_hints(p)[0]}")
+
+    @tree.command(name="hint2", description="Get hint 2 (limited per day)")
+    async def slash_hint2(interaction: discord.Interaction):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
+            return
+        st = load_state()
+        ok, used = consume_hint(st, interaction.user.id, today_str_ph())
+        if not ok:
+            await send_ephemeral(interaction, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
+            return
+        save_state(st)
+        hints = tutor_hints(p)
+        await send_ephemeral(interaction, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {hints[1] if len(hints) > 1 else hints[0]}")
+
+    @tree.command(name="hint3", description="Get hint 3 (limited per day)")
+    async def slash_hint3(interaction: discord.Interaction):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
+            return
+        st = load_state()
+        ok, used = consume_hint(st, interaction.user.id, today_str_ph())
+        if not ok:
+            await send_ephemeral(interaction, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
+            return
+        save_state(st)
+        hints = tutor_hints(p)
+        msg = hints[2] if len(hints) > 2 else hints[-1]
+        if TUTOR_FULL_CODE:
+            msg += "\n\n✅ *(Tutor mode)* `TUTOR_FULL_CODE=true` is enabled."
+        await send_ephemeral(interaction, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {msg}")
+
+    @tree.command(name="dryrun", description="Show sample input/output again")
+    async def slash_dryrun(interaction: discord.Interaction):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
+            return
+        await send_ephemeral(
+            interaction,
+            "🧪 **Sample Dry Run**\n"
+            f"**Sample Input**\n```text\n{p.get('sample_in','')}```"
+            f"**Sample Output**\n```text\n{p.get('sample_out','')}```"
+        )
+
+    @tree.command(name="constraints", description="Show constraints for today's MP")
+    async def slash_constraints(interaction: discord.Interaction):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
+            return
+        await send_ephemeral(interaction, f"📌 **Constraints**\n{p.get('constraints','-')}")
+
+    @tree.command(name="leaderboard", description="Show weekly leaderboard")
+    async def slash_leaderboard(interaction: discord.Interaction):
+        st = load_state()
+        rows = list(st.get("scores", {}).values())
+        if not rows:
+            await send_ephemeral(interaction, "No leaderboard data yet.")
+            return
+        rows.sort(key=lambda r: (int(r.get("weekly_accepts", 0)), int(r.get("accepted", 0))), reverse=True)
+        lines = ["🏆 **Weekly Leaderboard**"]
+        for i, r in enumerate(rows[:10], start=1):
+            lines.append(f"{i}. **{r.get('name','user')}** — weekly `{r.get('weekly_accepts',0)}` | total `{r.get('accepted',0)}` | streak `{r.get('streak',0)}`")
+        await interaction.response.send_message("\n".join(lines))
+
     @tree.command(name="submit", description="Submit your C++ solution (paste code or attach .cpp)")
     @app_commands.describe(code="Paste your full C++ code here (optional if you attach a file)",
                            file="Attach a .cpp/.cc/.cxx/.txt file (optional if you paste code)")
@@ -965,8 +1133,8 @@ if ENABLE_SLASH:
             await send_ephemeral(interaction, msg)
 
         await send_ephemeral(interaction, "✅ Submission received. Starting judge...")
-
         channel_id = interaction.channel.id if interaction.channel else 0
+
         await judge_submission(
             user_id=interaction.user.id,
             user_display=str(interaction.user),
@@ -977,8 +1145,35 @@ if ENABLE_SLASH:
             result_cb=result,
         )
 
+    @tree.command(name="status", description="Admin: show bot status/metrics")
+    @slash_admin_only()
+    async def slash_status(interaction: discord.Interaction):
+        st = load_state()
+        date_str = today_str_ph()
+        stored = date_str in st.get("problems_by_date", {})
+        di = int(st.get("day_index", 0))
+        up = int(time.monotonic() - BOT_START_MONO)
+        nxt = next_post_time_ph()
+
+        await send_ephemeral(
+            interaction,
+            "**Bot Status**\n"
+            f"- Uptime: `{up}s`\n"
+            f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` | ENABLE_SLASH: `{ENABLE_SLASH}`\n"
+            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
+            f"- Day index: `{di}`\n"
+            f"- Today stored: `{stored}` ({date_str})\n"
+            f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
+            f"- Queue busy: `{SUBMIT_LOCK.locked()}`\n"
+            f"- DAILY_CHANNEL_ID: `{DAILY_CHANNEL_ID}`\n"
+            f"- SUBMIT_CHANNEL_ID: `{SUBMIT_CHANNEL_ID}`\n"
+            f"- GPP: `{GPP}` exists=`{bool(shutil.which(GPP) or os.path.exists(GPP))}`\n"
+            f"- Metrics: `{JUDGE_METRICS}`\n"
+            f"- Build: `{BOT_UPDATES_VERSION}`\n"
+        )
+
     @tree.command(name="postnow", description="Admin: post today's problem now")
-    @admin_only()
+    @slash_admin_only()
     async def slash_postnow(interaction: discord.Interaction):
         if DAILY_CHANNEL_ID == 0:
             await send_ephemeral(interaction, "❌ DAILY_CHANNEL_ID not set.")
@@ -1007,17 +1202,225 @@ if ENABLE_SLASH:
 
         await send_ephemeral(interaction, f"✅ Posted today’s problem to <#{DAILY_CHANNEL_ID}> (day_index was {di}).")
 
+    @tree.command(name="reset_today", description="Admin: reset today's stored problem")
+    @slash_admin_only()
+    async def slash_reset_today(interaction: discord.Interaction):
+        st = load_state()
+        date_str = today_str_ph()
+        pb = st.get("problems_by_date", {})
+
+        if date_str not in pb:
+            await send_ephemeral(interaction, "✅ Nothing to reset for today (no stored problem).")
+            return
+
+        pb.pop(date_str, None)
+        st["problems_by_date"] = pb
+        st["last_posted_date"] = None
+        save_state(st)
+        await send_ephemeral(interaction, "✅ Reset done. Use `/postnow` to post a new problem for today.")
+
+    @tree.command(name="regen_today", description="Admin: regenerate today's problem (new seed)")
+    @slash_admin_only()
+    async def slash_regen_today(interaction: discord.Interaction):
+        st = load_state()
+        date_str = today_str_ph()
+        di = int(st.get("day_index", 0))
+        p = generate_problem(di, date_str)
+        st.setdefault("problems_by_date", {})[date_str] = p
+        st["day_index"] = di + 1
+        st["last_posted_date"] = date_str
+        append_audit(st, {"action": "regen_today", "by": str(interaction.user), "day_index": di, "seed": p.get("seed")})
+        save_state(st)
+
+        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
+        if ch and isinstance(ch, discord.abc.Messageable):
+            await ch.send("⚙️ **DAILY MP DROP (regenerated):**", embed=build_embed(p))
+
+        await send_ephemeral(interaction, f"✅ Regenerated today's problem (seed={p.get('seed')}).")
+
+    @tree.command(name="repost_date", description="Admin: repost stored problem for a date (YYYY-MM-DD)")
+    @slash_admin_only()
+    @app_commands.describe(date="Date like 2026-02-13")
+    async def slash_repost_date(interaction: discord.Interaction, date: str):
+        st = load_state()
+        p = st.get("problems_by_date", {}).get(date)
+        if not p:
+            await send_ephemeral(interaction, "❌ No stored problem for that date.")
+            return
+        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
+        if ch is None or not isinstance(ch, discord.abc.Messageable):
+            await send_ephemeral(interaction, "❌ Daily channel not found.")
+            return
+        await ch.send(f"⚙️ **DAILY MP DROP (backfill {date}):**", embed=build_embed(p))
+        append_audit(st, {"action": "repost_date", "by": str(interaction.user), "date": date})
+        save_state(st)
+        await send_ephemeral(interaction, "✅ Reposted.")
+
+    dev = app_commands.Group(name="dev", description="Admin: dev tools")
+
+    @dev.command(name="help", description="Show dev commands")
+    @slash_admin_only()
+    async def dev_help(interaction: discord.Interaction):
+        await send_ephemeral(
+            interaction,
+            "**DEV COMMANDS:**\n"
+            "`/dev list` → list all families/kinds\n"
+            "`/dev random [family]` → pick random problem\n"
+            "`/dev pick <family> <kind>` → pick specific problem\n"
+            "`/dev setup` → show runtime config\n"
+        )
+
+    @dev.command(name="setup", description="Show runtime config")
+    @slash_admin_only()
+    async def dev_setup(interaction: discord.Interaction):
+        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
+        await send_ephemeral(
+            interaction,
+            f"✅ Bot online.\n"
+            f"- Daily channel ID: `{DAILY_CHANNEL_ID}` (name: `{getattr(ch, 'name', None)}`)\n"
+            f"- Submit channel ID: `{SUBMIT_CHANNEL_ID}` (0 means any channel)\n"
+            f"- Post time: `{POST_TIME}` (PH time)\n"
+            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
+            f"- Windows mode: `{IS_WINDOWS}`\n"
+            f"- GPP: `{GPP}`\n"
+            f"- ADMIN_ROLES: `{ADMIN_ROLES}`\n"
+        )
+
+    @dev.command(name="list", description="List all families and kinds")
+    @slash_admin_only()
+    async def dev_list(interaction: discord.Interaction):
+        msg = "**FAMILIES AND KINDS:**\n"
+        total_count = 0
+        for f, kinds in family_kinds.items():
+            msg += f"- **{f}**: {', '.join(f'`{k}`' for k in kinds)}\n"
+            total_count += len(kinds)
+        msg += f"\n**Total:** {total_count}"
+        await send_ephemeral(interaction, msg)
+
+    @dev.command(name="random", description="Pick a random problem (optionally choose a family)")
+    @slash_admin_only()
+    @app_commands.describe(family="Optional family like arrays_basic")
+    async def dev_random(interaction: discord.Interaction, family: Optional[str] = None):
+        st = load_state()
+        date_str = today_str_ph()
+
+        if family is None:
+            family = random.choice(list(family_kinds.keys()))
+        else:
+            family = family.lower().strip()
+            if family not in family_kinds:
+                families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
+                await send_ephemeral(interaction, f"❌ Invalid family '{family}'. Available:\n{families_list}")
+                return
+
+        kind = random.choice(family_kinds[family])
+        day_index = 0
+        seed = stable_seed_for_day(day_index, date_str)
+        rng = random.Random(seed)
+
+        try:
+            if family == "arrays_basic":
+                p = gen_arrays_basic(rng, kind=kind)
+            elif family == "arrays_nested":
+                p = gen_arrays_nested(rng, kind=kind)
+            elif family == "bool_checks":
+                p = gen_bool_checks(rng, kind=kind)
+            elif family == "functions":
+                p = gen_functions(rng, kind=kind)
+            elif family == "patterns":
+                p = gen_patterns(rng, kind=kind)
+            elif family == "strings":
+                p = gen_strings(rng, kind=kind)
+            elif family == "math_logic":
+                p = gen_math_logic(rng, kind=kind)
+            elif family == "recursion":
+                p = gen_recursion(rng, kind=kind)
+            elif family == "stl_intro":
+                p = gen_stl_intro(rng, kind=kind)
+            else:
+                await send_ephemeral(interaction, "❌ Unexpected error: family not recognized.")
+                return
+        except ValueError as e:
+            await send_ephemeral(interaction, f"❌ {e}")
+            return
+
+        p["day"] = date_str
+        p["seed"] = seed
+        p["day_index"] = day_index
+
+        st.setdefault("problems_by_date", {})[date_str] = p
+        st["last_posted_date"] = date_str
+        st["day_index"] = day_index + 1
+        save_state(st)
+
+        await interaction.response.send_message(f"⚙️ **DEV PICK RANDOM:** {family} • {kind}", embed=build_embed(p))
+
+    @dev.command(name="pick", description="Pick a specific family+kind")
+    @slash_admin_only()
+    @app_commands.describe(family="Family (e.g. arrays_basic)", kind="Kind (from /dev list)")
+    async def dev_pick(interaction: discord.Interaction, family: str, kind: str):
+        st = load_state()
+        date_str = today_str_ph()
+        family = family.lower().strip()
+        kind = kind.strip()
+
+        if family not in family_kinds:
+            families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
+            await send_ephemeral(interaction, f"❌ Invalid family. Available:\n{families_list}")
+            return
+
+        if kind not in family_kinds[family]:
+            kinds_list = ", ".join(f"`{k}`" for k in family_kinds[family])
+            await send_ephemeral(interaction, f"❌ Invalid kind for `{family}`. Available:\n{kinds_list}")
+            return
+
+        day_index = 0
+        seed = stable_seed_for_day(day_index, date_str)
+        rng = random.Random(seed)
+
+        try:
+            if family == "arrays_basic":
+                p = gen_arrays_basic(rng, kind=kind)
+            elif family == "arrays_nested":
+                p = gen_arrays_nested(rng, kind=kind)
+            elif family == "bool_checks":
+                p = gen_bool_checks(rng, kind=kind)
+            elif family == "functions":
+                p = gen_functions(rng, kind=kind)
+            elif family == "patterns":
+                p = gen_patterns(rng, kind=kind)
+            elif family == "strings":
+                p = gen_strings(rng, kind=kind)
+            elif family == "math_logic":
+                p = gen_math_logic(rng, kind=kind)
+            elif family == "recursion":
+                p = gen_recursion(rng, kind=kind)
+            elif family == "stl_intro":
+                p = gen_stl_intro(rng, kind=kind)
+            else:
+                await send_ephemeral(interaction, "❌ Unexpected error: family not recognized.")
+                return
+        except ValueError as e:
+            await send_ephemeral(interaction, f"❌ {e}")
+            return
+
+        p["day"] = date_str
+        p["seed"] = seed
+        p["day_index"] = day_index
+
+        st.setdefault("problems_by_date", {})[date_str] = p
+        st["last_posted_date"] = date_str
+        st["day_index"] = day_index + 1
+        save_state(st)
+
+        await interaction.response.send_message(f"⚙️ **DEV PICK:** {family} • {kind}", embed=build_embed(p))
+
+    tree.add_command(dev)
+
 # =========================
 # PREFIX COMMANDS
 # =========================
 if ENABLE_PREFIX:
-    def prefix_admin_only():
-        async def predicate(ctx: commands.Context) -> bool:
-            if not ctx.guild or not isinstance(ctx.author, discord.Member):
-                return False
-            return is_admin_member(ctx.author)
-        return commands.check(predicate)
-
     @bot.command(name="help")
     async def p_help(ctx: commands.Context):
         await send_public(ctx, help_text())
@@ -1032,13 +1435,13 @@ if ENABLE_PREFIX:
             await ctx.send("DM context (not a server).")
             return
         await ctx.send(
-            f"✅ I can read your message.\n"
-            f"User: `{ctx.author}`\n"
-            f"Admin perm: `{ctx.author.guild_permissions.administrator}`\n"
-            f"Roles: `{[r.name for r in ctx.author.roles]}`\n"
-            f"ADMIN_ROLES expected: `{ADMIN_ROLES}`\n"
-            f"Prefix enabled: `{ENABLE_PREFIX}` Prefix: `{COMMAND_PREFIX}`\n"
-            f"Message Content Intent (code): `{intents.message_content}`"
+            "✅ Prefix system is working.\n"
+            f"- User: `{ctx.author}`\n"
+            f"- Admin perm: `{ctx.author.guild_permissions.administrator}`\n"
+            f"- Roles: `{[r.name for r in ctx.author.roles]}`\n"
+            f"- ADMIN_ROLES expected: `{ADMIN_ROLES}`\n"
+            f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` Prefix: `{COMMAND_PREFIX}`\n"
+            f"- message_content intent (code): `{bot.intents.message_content}`"
         )
 
     @bot.command(name="today")
@@ -1050,10 +1453,191 @@ if ENABLE_PREFIX:
             return
         await send_public(ctx, embed=build_embed(p))
 
+    @bot.command(name="rules")
+    async def p_rules(ctx: commands.Context):
+        await send_public(
+            ctx,
+            "**How to Submit (C++ only)**\n"
+            f"Use `{COMMAND_PREFIX}submit` and either:\n"
+            "1) Paste your full code after the command (you may include a ```cpp``` block), OR\n"
+            "2) Attach a `.cpp` file.\n\n"
+            "**No prompts** like `Enter n:` — output must match exactly."
+        )
+
+    @bot.command(name="format")
+    async def p_format(ctx: commands.Context):
+        await p_rules(ctx)
+
+    @bot.command(name="explain")
+    async def p_explain(ctx: commands.Context):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            return
+        fam = str(p.get("family", "")).lower()
+        mapping = {
+            "arrays_basic": "🧠 **Arrays**: store input values in an array/vector and process using indexing like `a[i]`.",
+            "arrays_nested": "🧠 **Arrays (nested)**: store data and use nested loops (`for` inside `for`).",
+            "functions": "🧠 **Functions**: define at least one user-defined function (besides `main`) and call it from `main()`.",
+            "recursion": "🧠 **Recursion**: create a function that calls itself with a smaller input, with a clear base case.",
+            "strings": "🧠 **Strings**: use `string` / `getline` and handle spaces vs tokens carefully.",
+            "patterns": "🧠 **Patterns**: use loops to print line-by-line; outer loop = rows, inner loop = columns.",
+            "stl_intro": "🧠 **STL**: use `vector`, `sort`, `set`, `map`, etc. as required.",
+        }
+        await send_public(ctx, mapping.get(fam, f"🧠 Topic: **{fam}**. Follow the input/output format and apply the required concept."))
+
+    @bot.command(name="approach")
+    async def p_approach(ctx: commands.Context):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            return
+        fam = str(p.get("family", "")).lower()
+        steps = ["1) Read input exactly as specified."]
+        if fam == "arrays_basic":
+            steps += ["2) Store the n values in `vector<long long> a(n)`.","3) Loop through `a[i]` to compute the required result.","4) Print the result only (no prompts)."]
+        elif fam == "arrays_nested":
+            steps += ["2) Store the data (often 2D / multiple values).","3) Use nested loops (`for` inside `for`) to compute.","4) Print result only."]
+        elif fam == "functions":
+            steps += ["2) Write a helper function that solves the core task.","3) Call it from `main()` and print the return value."]
+        elif fam == "recursion":
+            steps += ["2) Identify base case.","3) Write recursive step reducing the problem size.","4) Call the recursive function and print the result."]
+        else:
+            steps += ["2) Use the required topic tools (see `!explain`).", "3) Match output format exactly."]
+        await send_public(ctx, "🧩 **Approach (today's problem)**\n" + "\n".join(steps))
+
+    @bot.command(name="hint")
+    async def p_hint(ctx: commands.Context):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            return
+        st = load_state()
+        ok, used = consume_hint(st, ctx.author.id, today_str_ph())
+        if not ok:
+            await send_public(ctx, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
+            return
+        save_state(st)
+        await send_public(ctx, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {tutor_hints(p)[0]}")
+
+    @bot.command(name="hint2")
+    async def p_hint2(ctx: commands.Context):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            return
+        st = load_state()
+        ok, used = consume_hint(st, ctx.author.id, today_str_ph())
+        if not ok:
+            await send_public(ctx, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
+            return
+        save_state(st)
+        hints = tutor_hints(p)
+        await send_public(ctx, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {hints[1] if len(hints) > 1 else hints[0]}")
+
+    @bot.command(name="hint3")
+    async def p_hint3(ctx: commands.Context):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            return
+        st = load_state()
+        ok, used = consume_hint(st, ctx.author.id, today_str_ph())
+        if not ok:
+            await send_public(ctx, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
+            return
+        save_state(st)
+        hints = tutor_hints(p)
+        msg = hints[2] if len(hints) > 2 else hints[-1]
+        if TUTOR_FULL_CODE:
+            msg += "\n\n✅ *(Tutor mode)* `TUTOR_FULL_CODE=true` is enabled."
+        await send_public(ctx, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {msg}")
+
+    @bot.command(name="dryrun")
+    async def p_dryrun(ctx: commands.Context):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            return
+        await send_public(
+            ctx,
+            "🧪 **Sample Dry Run**\n"
+            f"**Sample Input**\n```text\n{p.get('sample_in','')}```"
+            f"**Sample Output**\n```text\n{p.get('sample_out','')}```"
+        )
+
+    @bot.command(name="constraints")
+    async def p_constraints(ctx: commands.Context):
+        p = get_today_problem_from_state()
+        if not p:
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            return
+        await send_public(ctx, f"📌 **Constraints**\n{p.get('constraints','-')}")
+
+    @bot.command(name="leaderboard")
+    async def p_leaderboard(ctx: commands.Context):
+        st = load_state()
+        rows = list(st.get("scores", {}).values())
+        if not rows:
+            await send_public(ctx, "No leaderboard data yet.")
+            return
+        rows.sort(key=lambda r: (int(r.get("weekly_accepts", 0)), int(r.get("accepted", 0))), reverse=True)
+        lines = ["🏆 **Weekly Leaderboard**"]
+        for i, r in enumerate(rows[:10], start=1):
+            lines.append(f"{i}. **{r.get('name','user')}** — weekly `{r.get('weekly_accepts',0)}` | total `{r.get('accepted',0)}` | streak `{r.get('streak',0)}`")
+        await send_public(ctx, "\n".join(lines))
+
+    @bot.command(name="submit")
+    async def p_submit(ctx: commands.Context, *, payload: str = ""):
+        attachment = ctx.message.attachments[0] if ctx.message.attachments else None
+
+        async def progress(msg: str):
+            await send_public(ctx, msg)
+
+        async def result(msg: str):
+            await send_public(ctx, msg)
+
+        await progress("✅ Submission received. Starting judge...")
+        await judge_submission(
+            user_id=ctx.author.id,
+            user_display=str(ctx.author),
+            channel_id=ctx.channel.id,
+            code_text=payload.strip() if payload.strip() else None,
+            attachment=attachment,
+            progress_cb=progress,
+            result_cb=result,
+        )
+
+    # ---- PREFIX: ADMIN ----
+    @bot.command(name="status")
+    @prefix_admin_only()
+    async def p_status(ctx: commands.Context):
+        st = load_state()
+        date_str = today_str_ph()
+        stored = date_str in st.get("problems_by_date", {})
+        di = int(st.get("day_index", 0))
+        up = int(time.monotonic() - BOT_START_MONO)
+        nxt = next_post_time_ph()
+        await send_public(
+            ctx,
+            "**Bot Status**\n"
+            f"- Uptime: `{up}s`\n"
+            f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` | ENABLE_SLASH: `{ENABLE_SLASH}`\n"
+            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
+            f"- Day index: `{di}`\n"
+            f"- Today stored: `{stored}` ({date_str})\n"
+            f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
+            f"- Queue busy: `{SUBMIT_LOCK.locked()}`\n"
+            f"- DAILY_CHANNEL_ID: `{DAILY_CHANNEL_ID}`\n"
+            f"- SUBMIT_CHANNEL_ID: `{SUBMIT_CHANNEL_ID}`\n"
+            f"- GPP: `{GPP}` exists=`{bool(shutil.which(GPP) or os.path.exists(GPP))}`\n"
+            f"- Metrics: `{JUDGE_METRICS}`\n"
+            f"- Build: `{BOT_UPDATES_VERSION}`\n"
+        )
+
     @bot.command(name="postnow")
     @prefix_admin_only()
     async def p_postnow(ctx: commands.Context):
-        # HARDENED: show explicit errors instead of silent fail
         if DAILY_CHANNEL_ID == 0:
             await send_public(ctx, "❌ DAILY_CHANNEL_ID is 0 / missing. Set env DAILY_CHANNEL_ID.")
             return
@@ -1063,7 +1647,7 @@ if ENABLE_PREFIX:
             await send_public(ctx, f"❌ Can't find channel for DAILY_CHANNEL_ID={DAILY_CHANNEL_ID}. Check the ID.")
             return
         if not isinstance(ch, discord.abc.Messageable):
-            await send_public(ctx, "❌ Daily channel is not messageable (type mismatch).")
+            await send_public(ctx, "❌ Daily channel is not messageable.")
             return
 
         try:
@@ -1088,31 +1672,10 @@ if ENABLE_PREFIX:
 
             await send_public(ctx, f"✅ Posted today’s problem to <#{DAILY_CHANNEL_ID}> (day_index was {di}).")
         except discord.Forbidden:
-            await send_public(ctx, "❌ Bot lacks permission to send messages/embeds in the daily channel (need Send Messages + Embed Links).")
+            await send_public(ctx, "❌ Bot lacks permission in daily channel (Send Messages + Embed Links).")
         except Exception as e:
             logging.exception("postnow error: %s", e)
-            await send_public(ctx, f"❌ postnow crashed: `{type(e).__name__}`")
-
-# =========================
-# IMPORTANT: PREFIX ERROR HANDLER (FIXES SILENT FAIL)
-# =========================
-@bot.event
-async def on_command_error(ctx: commands.Context, error: Exception):
-    if isinstance(error, CommandNotFound):
-        return
-
-    if isinstance(error, CheckFailure):
-        roles = [r.name for r in ctx.author.roles] if isinstance(ctx.author, discord.Member) else []
-        await ctx.send(
-            "❌ You don't have permission to use this command.\n"
-            f"Expected ADMIN_ROLES: `{ADMIN_ROLES}`\n"
-            f"Your roles: `{roles}`\n"
-            "If this is wrong, double-check role name spelling/case."
-        )
-        return
-
-    logging.exception("Command error: %s", error)
-    await ctx.send(f"❌ Command error: `{type(error).__name__}`")
+            await send_public(ctx, f"❌ postnow crashed: `{type(e).__name__}` (check logs)")
 
 # =========================
 # READY: SYNC + START TASKS
@@ -1124,14 +1687,7 @@ async def on_ready():
                  DAILY_CHANNEL_ID, SUBMIT_CHANNEL_ID, ENABLE_PREFIX, ENABLE_SLASH, ENFORCE_SKILLS, ADMIN_ROLES)
     logging.info("Config: COMPILE_TIMEOUT=%ss RUN_TIMEOUT=%ss MAX_CODE_BYTES=%s COOLDOWN=%ss",
                  COMPILE_TIMEOUT_SEC, RUN_TIMEOUT_SEC, MAX_CODE_BYTES, SUBMIT_COOLDOWN_SEC)
-
-    # If prefix commands aren't responding, 99% it's Message Content Intent in Developer Portal.
-    if ENABLE_PREFIX and not intents.message_content:
-        logging.warning("Prefix commands enabled but message_content intent is False in code.")
-    if ENABLE_PREFIX:
-        logging.warning(
-            "If !commands still don't work: enable 'Message Content Intent' in Discord Developer Portal → Bot → Privileged Gateway Intents."
-        )
+    logging.info("Command System: prefix=%r message_content_intent(code)=%s", COMMAND_PREFIX, bot.intents.message_content)
 
     if ENABLE_SLASH:
         try:
