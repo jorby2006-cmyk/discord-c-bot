@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any, Callable, Awaitable
 
 import discord
-from discord import app_commands
 from discord.ext import tasks, commands
 from discord.ext.commands import CheckFailure, CommandNotFound
 
@@ -49,9 +48,11 @@ DAILY_CHANNEL_ID = int(os.getenv("DAILY_CHANNEL_ID", "0"))  # required
 SUBMIT_CHANNEL_ID = int(os.getenv("SUBMIT_CHANNEL_ID", "0"))  # optional; 0 = any channel
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-ENABLE_SLASH = os.getenv("ENABLE_SLASH", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+# ✅ Prefix only (slash commands removed)
 ENABLE_PREFIX = os.getenv("ENABLE_PREFIX", "true").strip().lower() in ("1", "true", "yes", "y", "on")
-COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!").strip() or "!"
+
+# ✅ Use "c" as default prefix (commands become: chelp, csubmit, ctoday...)
+COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "c").strip() or "c"
 
 # Philippines time (UTC+8). Daily post is at 09:00 AM PH time.
 PH_TZ = datetime.timezone(datetime.timedelta(hours=8))
@@ -77,6 +78,13 @@ TUTOR_FULL_CODE = os.getenv("TUTOR_FULL_CODE", "false").strip().lower() in ("1",
 STRICT_ARRAYS = os.getenv("STRICT_ARRAYS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 # If you want "strict functions" (require helper besides main, not lambda) set true.
 STRICT_FUNCTIONS = os.getenv("STRICT_FUNCTIONS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+
+# ---- Anti-plagiarism (token fingerprint) ----
+PLAGIARISM_ENABLED = os.getenv("PLAGIARISM_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+PLAGIARISM_THRESHOLD = float(os.getenv("PLAGIARISM_THRESHOLD", "0.88"))
+PLAGIARISM_MIN_TOKENS = int(os.getenv("PLAGIARISM_MIN_TOKENS", "80"))
+PLAGIARISM_HARD_FAIL = os.getenv("PLAGIARISM_HARD_FAIL", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+PLAGIARISM_COMPARE_ACCEPTED_ONLY = os.getenv("PLAGIARISM_COMPARE_ACCEPTED_ONLY", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 
 ADMIN_ROLES = [r.strip() for r in os.getenv("ADMIN_ROLES", "Root Admin").split(",") if r.strip()]
 
@@ -113,7 +121,7 @@ SKILL_HARD_FAIL_CONFIDENCE = float(os.getenv("SKILL_HARD_FAIL_CONFIDENCE", "0.90
 SKILL_WARN_CONFIDENCE = float(os.getenv("SKILL_WARN_CONFIDENCE", "0.60"))
 HINTS_PER_DAY_LIMIT = int(os.getenv("HINTS_PER_DAY_LIMIT", "5"))
 
-BOT_UPDATES_VERSION = "2026-02-strict-skillchecks-fixed-regex-flags"
+BOT_UPDATES_VERSION = "2026-02-prefix-c-only-antiplag-fixed"
 
 # =========================
 # DISCORD BOT SETUP
@@ -154,15 +162,6 @@ def prefix_admin_only():
     return commands.check(predicate)
 
 
-def slash_admin_only():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return False
-        return is_admin_member(interaction.user)
-
-    return app_commands.check(predicate)
-
-
 # =========================
 # TIME HELPERS
 # =========================
@@ -192,13 +191,14 @@ def default_state() -> dict:
         "hint_usage": {},
         "scores": {},
         "audit_log": [],
+        "plagiarism_db": {},
     }
 
 
 def _state_with_defaults(raw: dict) -> dict:
     base = default_state()
     base.update(raw or {})
-    for k in ("problems_by_date", "cooldowns", "compile_errors", "hint_usage", "scores"):
+    for k in ("problems_by_date", "cooldowns", "compile_errors", "hint_usage", "scores", "plagiarism_db"):
         if not isinstance(base.get(k), dict):
             base[k] = {}
     if not isinstance(base.get("audit_log"), list):
@@ -337,10 +337,6 @@ def pick_family(day_index: int) -> str:
 
 
 def pick_kind_for_family(family: str, seed: int) -> Optional[str]:
-    """
-    Deterministic kind selection (no 'random' manual tools).
-    Uses seed mod N so it stays stable for a given day+day_index.
-    """
     kinds = family_kinds.get(family)
     if not kinds:
         return None
@@ -383,7 +379,6 @@ def generate_problem(day_index: int, date_str: str) -> dict:
         else:
             p = gen_stl_intro(rng, kind=kind) if kind else gen_stl_intro(rng)
     except TypeError:
-        # If any generator doesn't accept `kind`, fallback safely.
         if family == "arrays_basic":
             p = gen_arrays_basic(rng)
         elif family == "arrays_nested":
@@ -403,7 +398,6 @@ def generate_problem(day_index: int, date_str: str) -> dict:
         else:
             p = gen_stl_intro(rng)
 
-    # annotate
     p["day"] = date_str
     p["seed"] = seed
     p["day_index"] = day_index
@@ -442,12 +436,10 @@ def build_embed(problem: dict) -> discord.Embed:
     embed.add_field(name="Sample Input", value=f"```text\n{problem['sample_in']}```", inline=False)
     embed.add_field(name="Sample Output", value=f"```text\n{problem['sample_out']}```", inline=False)
 
-    how = []
-    if ENABLE_PREFIX:
-        how.append(f"Use `{COMMAND_PREFIX}submit` and paste your full C++ code (or attach a .cpp file).")
-    if ENABLE_SLASH:
-        how.append("Use `/submit` and paste your full C++ code (or attach a .cpp file).")
-    how.append("No prompts like `Enter n:` — output must match exactly.")
+    how = [
+        f"Use `{COMMAND_PREFIX}submit` and paste your full C++ code (or attach a .cpp file).",
+        "No prompts like `Enter n:` — output must match exactly.",
+    ]
     embed.add_field(name="How to Submit (C++ only)", value=" ".join(how), inline=False)
 
     embed.set_footer(text=f"Day: {problem['day']} • Seed: {problem['seed']}")
@@ -595,12 +587,6 @@ _LINE_COMMENT_RE = re.compile(r"//.*?$", re.MULTILINE)
 
 
 def _strip_cpp_comments_and_strings(code: str) -> str:
-    """
-    Order matters:
-    1) replace strings/chars so '//' inside them won't get treated as a comment
-    2) remove /* */ block comments
-    3) remove // line comments
-    """
     if not code:
         return ""
     code = _STRING_RE.sub('""', code)
@@ -611,12 +597,7 @@ def _strip_cpp_comments_and_strings(code: str) -> str:
 
 
 def _has_user_defined_function(code: str) -> bool:
-    """
-    True if there is a real function definition besides main.
-    IMPORTANT: regex flags must be at the start; use re.VERBOSE + re.MULTILINE.
-    """
     c = _strip_cpp_comments_and_strings(code)
-
     fn_pat = re.compile(
         r"""
         ^\s*
@@ -638,14 +619,7 @@ def _has_user_defined_function(code: str) -> bool:
 
 
 def _has_array_declaration(code: str) -> bool:
-    """
-    Must detect real array declarations:
-    - vector<T> a;
-    - array<T, N> a;
-    - T a[N];
-    """
     c = _strip_cpp_comments_and_strings(code)
-
     has_vector = bool(re.search(r"\b(?:std::)?vector\s*<", c))
     has_std_array = bool(re.search(r"\b(?:std::)?array\s*<", c))
 
@@ -673,10 +647,8 @@ def _has_array_declaration(code: str) -> bool:
 
 def _has_array_indexing_or_loop_over_n(code: str) -> bool:
     c = _strip_cpp_comments_and_strings(code)
-    # some access signal
     has_bracket_index = bool(re.search(r"\b[_A-Za-z]\w*\s*\[\s*[^\]]+\s*\]", c))
     has_at = bool(re.search(r"\.\s*at\s*\(", c))
-    # a very common CS1 pattern: read n, loop n times
     looks_like_read_n_loop = bool(
         re.search(r"\bcin\s*>>\s*[_A-Za-z]\w*\s*;", c) and re.search(r"\bfor\s*\(", c)
     )
@@ -715,7 +687,6 @@ def _has_math_logic_ops(code: str) -> bool:
 
 def _has_recursion(code: str) -> bool:
     c = _strip_cpp_comments_and_strings(code)
-
     fn_pat = re.compile(
         r"""
         ^\s*
@@ -759,10 +730,8 @@ def enforce_skill(problem: dict, code: str) -> Tuple[bool, str, float]:
     fam = str(problem.get("family", "")).lower()
 
     if fam == "arrays_basic":
-        # STRICT: require a real array/vector declaration (not just loop).
         if STRICT_ARRAYS and not _has_array_declaration(code):
             return False, "❌ **ARRAYS (basic)**: You must declare an array/vector (e.g., `int a[n];` or `vector<int> a(n);`).", 0.99
-        # also require some use (indexing OR read-n loop)
         if not _has_array_indexing_or_loop_over_n(code):
             return False, "❌ **ARRAYS (basic)**: I didn’t detect array indexing (e.g., `a[i]`) or a typical `read n + loop n times` structure.", 0.95
 
@@ -803,6 +772,156 @@ def enforce_skill(problem: dict, code: str) -> Tuple[bool, str, float]:
             return False, "❌ **STL INTRO**: Use STL (e.g., `vector`, `set`, `map`, or `sort`).", 0.90
 
     return True, "", 1.0
+
+
+# =========================
+# ANTI-PLAGIARISM (token fingerprint)
+# =========================
+_TOKEN_RE = re.compile(
+    r"""
+    (?:[A-Za-z_]\w*)
+    |(?:0x[0-9A-Fa-f]+)
+    |(?:\d+\.\d+|\d+)
+    |(?:==|!=|<=|>=|->|::|\+\+|--|\+=|-=|\*=|/=|%=|&&|\|\|)
+    |(?:[^\s])
+    """,
+    re.VERBOSE,
+)
+
+_CPP_KEYWORDS = {
+    "alignas","alignof","and","and_eq","asm","atomic_cancel","atomic_commit","atomic_noexcept",
+    "auto","bitand","bitor","bool","break","case","catch","char","char8_t","char16_t","char32_t",
+    "class","compl","concept","const","consteval","constexpr","constinit","const_cast","continue",
+    "co_await","co_return","co_yield","decltype","default","delete","do","double","dynamic_cast",
+    "else","enum","explicit","export","extern","false","float","for","friend","goto","if","inline",
+    "int","long","mutable","namespace","new","noexcept","not","not_eq","nullptr","operator","or",
+    "or_eq","private","protected","public","register","reinterpret_cast","requires","return",
+    "short","signed","sizeof","static","static_assert","static_cast","struct","switch",
+    "synchronized","template","this","thread_local","throw","true","try","typedef","typeid",
+    "typename","union","unsigned","using","virtual","void","volatile","wchar_t","while","xor","xor_eq",
+}
+
+
+def _tokenize_cpp_for_plagiarism(code: str) -> List[str]:
+    c = _strip_cpp_comments_and_strings(code)
+    c = re.sub(r"(?m)^\s*#.*$", "", c)
+    tokens = _TOKEN_RE.findall(c)
+    return [t for t in tokens if t.strip()]
+
+
+def _canonicalize_tokens(tokens: List[str]) -> List[str]:
+    mapping: Dict[str, str] = {}
+    out: List[str] = []
+    next_id = 0
+    for t in tokens:
+        if re.fullmatch(r"[A-Za-z_]\w*", t) and (t not in _CPP_KEYWORDS):
+            if t not in mapping:
+                mapping[t] = f"id{next_id}"
+                next_id += 1
+            out.append(mapping[t])
+        else:
+            out.append(t)
+    return out
+
+
+def _fingerprint_tokens(tokens: List[str], *, k: int = 5, w: int = 4) -> set[int]:
+    if len(tokens) < k:
+        return set()
+    hashes: List[Tuple[int, int]] = []
+    for i in range(len(tokens) - k + 1):
+        gram = " ".join(tokens[i:i + k]).encode("utf-8", errors="ignore")
+        h = int(hashlib.sha1(gram).hexdigest()[:16], 16)
+        hashes.append((h, i))
+    if not hashes:
+        return set()
+    if len(hashes) <= w:
+        return {min(hashes)[0]}
+    fp: set[int] = set()
+    for start in range(0, len(hashes) - w + 1):
+        window = hashes[start:start + w]
+        fp.add(min(window)[0])
+    return fp
+
+
+def _jaccard(a: set[int], b: set[int]) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    uni = len(a | b)
+    return inter / uni if uni else 0.0
+
+
+def plagiarism_check_and_record(
+    state: dict,
+    *,
+    date_str: str,
+    user_id: int,
+    user_display: str,
+    code: str,
+    accepted: bool,
+) -> Tuple[bool, str, float]:
+    if not PLAGIARISM_ENABLED:
+        return True, "", 0.0
+
+    raw_tokens = _tokenize_cpp_for_plagiarism(code)
+    canon = _canonicalize_tokens(raw_tokens)
+    fp = _fingerprint_tokens(canon)
+
+    best_sim = 0.0
+    best_name = ""
+    best_uid = 0
+
+    entries = state.setdefault("plagiarism_db", {}).setdefault(date_str, [])
+
+    if len(raw_tokens) >= PLAGIARISM_MIN_TOKENS:
+        for e in entries:
+            if int(e.get("user_id", 0)) == int(user_id):
+                continue
+            if PLAGIARISM_COMPARE_ACCEPTED_ONLY and not bool(e.get("accepted", False)):
+                continue
+            other_fp = set(e.get("fp", []))
+            sim = _jaccard(fp, other_fp)
+            if sim > best_sim:
+                best_sim = sim
+                best_name = str(e.get("name", "unknown"))
+                best_uid = int(e.get("user_id", 0))
+
+    entries.append(
+        {"user_id": user_id, "name": user_display, "fp": sorted(fp), "tok": len(raw_tokens), "accepted": bool(accepted)}
+    )
+
+    if best_uid and best_sim >= PLAGIARISM_THRESHOLD:
+        msg = (
+            "🚫 **Possible plagiarism detected**\n"
+            f"- Similarity: `{best_sim:.2f}` (threshold `{PLAGIARISM_THRESHOLD:.2f}`)\n"
+            f"- Closest match: **{best_name}** (`{best_uid}`)\n\n"
+            "Please submit your **own** solution. If you believe this is a false positive, ask your teacher/admin."
+        )
+        return (False if PLAGIARISM_HARD_FAIL else True), msg, best_sim
+
+    if best_uid and best_sim >= max(0.0, PLAGIARISM_THRESHOLD - 0.10):
+        warn = (
+            "⚠️ **Similarity warning**\n"
+            f"- Similarity: `{best_sim:.2f}` (threshold `{PLAGIARISM_THRESHOLD:.2f}`)\n"
+            f"- Closest match: **{best_name}**\n"
+            "Make sure your solution is truly your own."
+        )
+        return True, warn, best_sim
+
+    return True, "", best_sim
+
+
+def mark_plagiarism_accepted(state: dict, *, date_str: str, user_id: int) -> None:
+    try:
+        entries = state.get("plagiarism_db", {}).get(date_str, [])
+        for e in reversed(entries):
+            if int(e.get("user_id", 0)) == int(user_id):
+                e["accepted"] = True
+                break
+    except Exception:
+        pass
 
 
 # =========================
@@ -883,7 +1002,6 @@ async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
     rc, out, err, _ = await run_subprocess(cmd, stdin_data=None, timeout_sec=COMPILE_TIMEOUT_SEC, cwd=workdir)
 
     if rc == 0 and os.path.exists(exe):
-        # Some Linux environments require execute bit.
         if not IS_WINDOWS:
             try:
                 os.chmod(exe, 0o755)
@@ -994,42 +1112,26 @@ def validate_config() -> None:
 
 
 # =========================
-# HELP TEXT
+# HELP TEXT (PREFIX ONLY)
 # =========================
 def help_text() -> str:
-    parts = ["**📌 CS1 Daily MP Bot — Commands**\n"]
-    if ENABLE_PREFIX:
-        parts += [
-            f"**Prefix (Student)**\n"
-            f"• `{COMMAND_PREFIX}help` • `{COMMAND_PREFIX}ping` • `{COMMAND_PREFIX}today` • `{COMMAND_PREFIX}submit` • `{COMMAND_PREFIX}rules`\n"
-            f"• `{COMMAND_PREFIX}explain` • `{COMMAND_PREFIX}approach` • `{COMMAND_PREFIX}hint` • `{COMMAND_PREFIX}hint2` • `{COMMAND_PREFIX}hint3`\n"
-            f"• `{COMMAND_PREFIX}dryrun` • `{COMMAND_PREFIX}constraints` • `{COMMAND_PREFIX}leaderboard`\n"
-            f"• `{COMMAND_PREFIX}whoami` • `{COMMAND_PREFIX}whotest`\n\n"
-            f"**Prefix (Admin)**\n"
-            f"• `{COMMAND_PREFIX}status` • `{COMMAND_PREFIX}postnow` • `{COMMAND_PREFIX}reset_today` • `{COMMAND_PREFIX}regen_today` • `{COMMAND_PREFIX}repost_date YYYY-MM-DD`\n"
-        ]
-    if ENABLE_SLASH:
-        parts += [
-            "\n**Slash (Student)**\n"
-            "• `/help` • `/ping` • `/today` • `/submit` • `/rules` • `/format` • `/explain` • `/approach`\n"
-            "• `/hint` • `/hint2` • `/hint3` • `/dryrun` • `/constraints` • `/leaderboard`\n\n"
-            "**Slash (Admin)**\n"
-            "• `/status` • `/postnow` • `/reset_today` • `/regen_today` • `/repost_date`\n"
-        ]
-    parts.append(f"\nBuild: `{BOT_UPDATES_VERSION}`")
-    return "".join(parts)
+    p = COMMAND_PREFIX
+    return (
+        "**📌 CS1 Daily MP Bot — Commands (Prefix only)**\n\n"
+        f"**Student**\n"
+        f"• `{p}help` • `{p}ping` • `{p}today` • `{p}submit` • `{p}rules`\n"
+        f"• `{p}explain` • `{p}approach` • `{p}hint` • `{p}hint2` • `{p}hint3`\n"
+        f"• `{p}dryrun` • `{p}constraints` • `{p}leaderboard`\n"
+        f"• `{p}whoami` • `{p}whotest`\n\n"
+        f"**Admin**\n"
+        f"• `{p}status` • `{p}postnow`\n\n"
+        f"Build: `{BOT_UPDATES_VERSION}`"
+    )
 
 
 # =========================
 # SHARED “SEND” HELPERS
 # =========================
-async def send_ephemeral(interaction: discord.Interaction, content: str = "", *, embed: Optional[discord.Embed] = None) -> None:
-    if interaction.response.is_done():
-        await interaction.followup.send(content, embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message(content, embed=embed, ephemeral=True)
-
-
 async def send_public(ctx: commands.Context, content: str = "", *, embed: Optional[discord.Embed] = None) -> None:
     await ctx.send(content, embed=embed)
 
@@ -1047,7 +1149,6 @@ async def judge_submission(
     progress_cb: Callable[[str], Awaitable[None]],
     result_cb: Callable[[str], Awaitable[None]],
 ) -> None:
-    # channel restriction
     if SUBMIT_CHANNEL_ID and channel_id != SUBMIT_CHANNEL_ID:
         if SUBMIT_CHANNEL_ID != DAILY_CHANNEL_ID:
             await result_cb(f"❌ Submit only in <#{SUBMIT_CHANNEL_ID}>.")
@@ -1068,7 +1169,7 @@ async def judge_submission(
         date_str = today_str_ph()
         problem = st.get("problems_by_date", {}).get(date_str)
         if not problem:
-            await result_cb("❌ No active problem for today. Ask admin to post today’s MP.")
+            await result_cb(f"❌ No active problem for today. Ask admin to `{COMMAND_PREFIX}postnow`.")
             return
 
         src, parse_err = await get_code_from_inputs(code_text, attachment)
@@ -1084,20 +1185,36 @@ async def judge_submission(
             return
 
         if re.search(r'cout\s*<<\s*".*(enter|input|please)', src, flags=re.IGNORECASE):
-            await progress_cb(
-                "⚠️ Heads up: prompts like `Enter n:` often cause Wrong Answer. Output should be answer only."
-            )
+            await progress_cb("⚠️ Heads up: prompts like `Enter n:` often cause Wrong Answer. Output should be answer only.")
 
         if ENFORCE_SKILLS:
             ok_skill, skill_msg, confidence = enforce_skill(problem, src)
             if not ok_skill and confidence >= SKILL_HARD_FAIL_CONFIDENCE:
-                await result_cb(
-                    skill_msg
-                    + f"\n(Confidence: {confidence:.2f}. Teacher: set `ENFORCE_SKILLS=false` to disable.)"
-                )
+                await result_cb(skill_msg + f"\n(Confidence: {confidence:.2f}. Teacher: set `ENFORCE_SKILLS=false` to disable.)")
                 return
             if not ok_skill and confidence >= SKILL_WARN_CONFIDENCE:
                 await progress_cb(f"⚠️ Skill-check warning (confidence {confidence:.2f}): {skill_msg}")
+
+        # ✅ Anti-plagiarism check (properly inside the function)
+        if PLAGIARISM_ENABLED:
+            ok_plag, plag_msg, plag_sim = plagiarism_check_and_record(
+                st,
+                date_str=date_str,
+                user_id=user_id,
+                user_display=user_display,
+                code=src,
+                accepted=False,
+            )
+            if plag_msg and ok_plag:
+                await progress_cb(plag_msg)
+
+            if not ok_plag:
+                append_audit(st, {"action": "plagiarism_block", "by": user_display, "user_id": user_id, "date": date_str, "similarity": plag_sim})
+                set_cooldown(st, user_id, COOLDOWN_AFTER_FAIL_SEC)
+                score_submission(st, user_id, user_display, accepted=False, date_str=date_str)
+                save_state(st)
+                await result_cb(plag_msg)
+                return
 
         tests = problem.get("tests", [])
         await progress_cb("🧪 Compiling...")
@@ -1148,9 +1265,7 @@ async def judge_submission(
                             f"**Got**\n```text\n{clamp_block(got, 900)}```"
                         )
                         if line_no:
-                            msg += (
-                                f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
-                            )
+                            msg += f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
                     else:
                         if tinp:
                             msg += f"**Input**\n```text\n{clamp_block(tinp, 1200)}```"
@@ -1158,13 +1273,14 @@ async def judge_submission(
                     return
 
             JUDGE_METRICS["accepted"] += 1
+            if PLAGIARISM_ENABLED:
+                mark_plagiarism_accepted(st, date_str=date_str, user_id=user_id)
+
             set_cooldown(st, user_id, COOLDOWN_AFTER_ACCEPT_SEC)
             score_submission(st, user_id, user_display, accepted=True, date_str=date_str)
             save_state(st)
 
-            await result_cb(
-                f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.\nProblem: **{problem['title']}** (Day {problem['day']})"
-            )
+            await result_cb(f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.\nProblem: **{problem['title']}** (Day {problem['day']})")
 
 
 # =========================
@@ -1172,10 +1288,6 @@ async def judge_submission(
 # =========================
 @bot.event
 async def on_message(message: discord.Message):
-    """
-    ✅ If you define on_message, you MUST call bot.process_commands
-    otherwise ALL prefix commands stop working.
-    """
     if message.author.bot:
         return
 
@@ -1208,316 +1320,7 @@ async def on_command_error(ctx: commands.Context, error: Exception):
 
 
 # =========================
-# SLASH COMMANDS
-# =========================
-if ENABLE_SLASH:
-    tree = bot.tree
-
-    @tree.command(name="help", description="Show all bot commands")
-    async def slash_help(interaction: discord.Interaction):
-        await send_ephemeral(interaction, help_text())
-
-    @tree.command(name="ping", description="Bot check")
-    async def slash_ping(interaction: discord.Interaction):
-        await send_ephemeral(interaction, "pong")
-
-    @tree.command(name="today", description="Show today's problem")
-    async def slash_today(interaction: discord.Interaction):
-        st = load_state()
-        date_str = today_str_ph()
-        p = st.get("problems_by_date", {}).get(date_str)
-        if not p:
-            await send_ephemeral(interaction, "❌ No problem stored for today yet. Ask admin to `/postnow` or wait for schedule.")
-            return
-        await interaction.response.send_message(embed=build_embed(p))
-
-    @tree.command(name="rules", description="Show how to submit")
-    async def slash_rules(interaction: discord.Interaction):
-        await send_ephemeral(
-            interaction,
-            "**How to Submit (C++ only)**\n"
-            "Use `/submit` and either:\n"
-            "1) Paste your full code in the `code` field (you may include a ```cpp``` block), OR\n"
-            "2) Attach a `.cpp` file.\n\n"
-            "**No prompts** like `Enter n:` — output must match exactly."
-        )
-
-    @tree.command(name="format", description="Alias for /rules")
-    async def slash_format(interaction: discord.Interaction):
-        await slash_rules(interaction)
-
-    @tree.command(name="explain", description="Explain today's topic")
-    async def slash_explain(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        fam = str(p.get("family", "")).lower()
-        mapping = {
-            "arrays_basic": "🧠 **Arrays**: store input values in an array/vector and process using indexing like `a[i]`.",
-            "arrays_nested": "🧠 **Arrays (nested)**: store data and use nested loops (`for` inside `for`).",
-            "functions": "🧠 **Functions**: define at least one user-defined function (besides `main`) and call it from `main()`.",
-            "recursion": "🧠 **Recursion**: create a function that calls itself with a smaller input, with a clear base case.",
-            "strings": "🧠 **Strings**: use `string` / `getline` and handle spaces vs tokens carefully.",
-            "patterns": "🧠 **Patterns**: use loops to print line-by-line; outer loop = rows, inner loop = columns.",
-            "stl_intro": "🧠 **STL**: use `vector`, `sort`, `set`, `map`, etc. as required.",
-        }
-        await send_ephemeral(interaction, mapping.get(fam, f"🧠 Topic: **{fam}**. Follow the input/output format and apply the required concept."))
-
-    @tree.command(name="approach", description="Suggested steps for today's MP")
-    async def slash_approach(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        fam = str(p.get("family", "")).lower()
-        steps = ["1) Read input exactly as specified."]
-        if fam == "arrays_basic":
-            steps += [
-                "2) Store values in an array/vector.",
-                "3) Loop through the values to compute the result.",
-                "4) Print the result only (no prompts).",
-            ]
-        elif fam == "arrays_nested":
-            steps += [
-                "2) Store the data (often 2D / multiple values).",
-                "3) Use nested loops (`for` inside `for`) to compute.",
-                "4) Print result only.",
-            ]
-        elif fam == "functions":
-            steps += ["2) Write a helper function that solves the core task.", "3) Call it from `main()` and print the return value."]
-        elif fam == "recursion":
-            steps += ["2) Identify base case.", "3) Write recursive step reducing the problem size.", "4) Call the recursive function and print the result."]
-        else:
-            steps += ["2) Use the required topic tools (see `/explain`).", "3) Match output format exactly."]
-        await send_ephemeral(interaction, "🧩 **Approach (today's problem)**\n" + "\n".join(steps))
-
-    @tree.command(name="hint", description="Get hint 1 (limited per day)")
-    async def slash_hint(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        st = load_state()
-        ok, used = consume_hint(st, interaction.user.id, today_str_ph())
-        if not ok:
-            await send_ephemeral(interaction, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
-            return
-        save_state(st)
-        await send_ephemeral(interaction, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {tutor_hints(p)[0]}")
-
-    @tree.command(name="hint2", description="Get hint 2 (limited per day)")
-    async def slash_hint2(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        st = load_state()
-        ok, used = consume_hint(st, interaction.user.id, today_str_ph())
-        if not ok:
-            await send_ephemeral(interaction, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
-            return
-        save_state(st)
-        hints = tutor_hints(p)
-        await send_ephemeral(interaction, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {hints[1] if len(hints) > 1 else hints[0]}")
-
-    @tree.command(name="hint3", description="Get hint 3 (limited per day)")
-    async def slash_hint3(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        st = load_state()
-        ok, used = consume_hint(st, interaction.user.id, today_str_ph())
-        if not ok:
-            await send_ephemeral(interaction, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
-            return
-        save_state(st)
-        hints = tutor_hints(p)
-        msg = hints[2] if len(hints) > 2 else hints[-1]
-        if TUTOR_FULL_CODE:
-            msg += "\n\n✅ *(Tutor mode)* `TUTOR_FULL_CODE=true` is enabled."
-        await send_ephemeral(interaction, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {msg}")
-
-    @tree.command(name="dryrun", description="Show sample input/output again")
-    async def slash_dryrun(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        await send_ephemeral(
-            interaction,
-            "🧪 **Sample Dry Run**\n"
-            f"**Sample Input**\n```text\n{p.get('sample_in','')}```"
-            f"**Sample Output**\n```text\n{p.get('sample_out','')}```"
-        )
-
-    @tree.command(name="constraints", description="Show constraints for today's MP")
-    async def slash_constraints(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        await send_ephemeral(interaction, f"📌 **Constraints**\n{p.get('constraints','-')}")
-
-    @tree.command(name="leaderboard", description="Show weekly leaderboard")
-    async def slash_leaderboard(interaction: discord.Interaction):
-        st = load_state()
-        rows = list(st.get("scores", {}).values())
-        if not rows:
-            await send_ephemeral(interaction, "No leaderboard data yet.")
-            return
-        rows.sort(key=lambda r: (int(r.get("weekly_accepts", 0)), int(r.get("accepted", 0))), reverse=True)
-        lines = ["🏆 **Weekly Leaderboard**"]
-        for i, r in enumerate(rows[:10], start=1):
-            lines.append(
-                f"{i}. **{r.get('name','user')}** — weekly `{r.get('weekly_accepts',0)}` | total `{r.get('accepted',0)}` | streak `{r.get('streak',0)}`"
-            )
-        await interaction.response.send_message("\n".join(lines))
-
-    @tree.command(name="submit", description="Submit your C++ solution (paste code or attach .cpp)")
-    @app_commands.describe(code="Paste your full C++ code here (optional if you attach a file)",
-                           file="Attach a .cpp/.cc/.cxx/.txt file (optional if you paste code)")
-    async def slash_submit(interaction: discord.Interaction, code: Optional[str] = None, file: Optional[discord.Attachment] = None):
-        async def progress(msg: str):
-            await send_ephemeral(interaction, msg)
-
-        async def result(msg: str):
-            await send_ephemeral(interaction, msg)
-
-        await send_ephemeral(interaction, "✅ Submission received. Starting judge...")
-        channel_id = interaction.channel.id if interaction.channel else 0
-
-        await judge_submission(
-            user_id=interaction.user.id,
-            user_display=str(interaction.user),
-            channel_id=channel_id,
-            code_text=code,
-            attachment=file,
-            progress_cb=progress,
-            result_cb=result,
-        )
-
-    # ---- SLASH: ADMIN ----
-    @tree.command(name="status", description="Admin: show bot status/metrics")
-    @slash_admin_only()
-    async def slash_status(interaction: discord.Interaction):
-        st = load_state()
-        date_str = today_str_ph()
-        stored = date_str in st.get("problems_by_date", {})
-        di = int(st.get("day_index", 0))
-        up = int(time.monotonic() - BOT_START_MONO)
-        nxt = next_post_time_ph()
-
-        await send_ephemeral(
-            interaction,
-            "**Bot Status**\n"
-            f"- Uptime: `{up}s`\n"
-            f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` | ENABLE_SLASH: `{ENABLE_SLASH}`\n"
-            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}` (STRICT_ARRAYS={STRICT_ARRAYS}, STRICT_FUNCTIONS={STRICT_FUNCTIONS})\n"
-            f"- Day index: `{di}`\n"
-            f"- Today stored: `{stored}` ({date_str})\n"
-            f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
-            f"- Queue busy: `{SUBMIT_LOCK.locked()}`\n"
-            f"- DAILY_CHANNEL_ID: `{DAILY_CHANNEL_ID}`\n"
-            f"- SUBMIT_CHANNEL_ID: `{SUBMIT_CHANNEL_ID}`\n"
-            f"- GPP: `{GPP}` exists=`{bool(shutil.which(GPP) or os.path.exists(GPP))}`\n"
-            f"- Metrics: `{JUDGE_METRICS}`\n"
-            f"- Build: `{BOT_UPDATES_VERSION}`\n"
-        )
-
-    @tree.command(name="postnow", description="Admin: post today's problem now")
-    @slash_admin_only()
-    async def slash_postnow(interaction: discord.Interaction):
-        if DAILY_CHANNEL_ID == 0:
-            await send_ephemeral(interaction, "❌ DAILY_CHANNEL_ID not set.")
-            return
-        ch = bot.get_channel(DAILY_CHANNEL_ID)
-        if ch is None or not isinstance(ch, discord.abc.Messageable):
-            await send_ephemeral(interaction, "❌ Daily channel not found. Check DAILY_CHANNEL_ID.")
-            return
-
-        st = load_state()
-        date_str = today_str_ph()
-        existing = st.get("problems_by_date", {}).get(date_str)
-        if existing:
-            await ch.send("⚙️ **DAILY MP DROP (repost):**", embed=build_embed(existing))
-            await send_ephemeral(interaction, "✅ Reposted the already-stored problem for today.")
-            return
-
-        di = int(st.get("day_index", 0))
-        p = generate_problem(di, date_str)
-        await ch.send("⚙️ **DAILY MP DROP (manual):** Solve it in C++ and submit.", embed=build_embed(p))
-
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["day_index"] = di + 1
-        st["last_posted_date"] = date_str
-        save_state(st)
-
-        await send_ephemeral(interaction, f"✅ Posted today’s problem to <#{DAILY_CHANNEL_ID}> (day_index was {di}).")
-
-    @tree.command(name="reset_today", description="Admin: reset today's stored problem")
-    @slash_admin_only()
-    async def slash_reset_today(interaction: discord.Interaction):
-        st = load_state()
-        date_str = today_str_ph()
-        pb = st.get("problems_by_date", {})
-
-        if date_str not in pb:
-            await send_ephemeral(interaction, "✅ Nothing to reset for today (no stored problem).")
-            return
-
-        pb.pop(date_str, None)
-        st["problems_by_date"] = pb
-        st["last_posted_date"] = None
-        save_state(st)
-        await send_ephemeral(interaction, "✅ Reset done. Use `/postnow` to post a new problem for today.")
-
-    @tree.command(name="regen_today", description="Admin: regenerate today's problem (advance to next day_index)")
-    @slash_admin_only()
-    async def slash_regen_today(interaction: discord.Interaction):
-        """
-        No manual random. This advances day_index and stores a new deterministic problem for today.
-        """
-        st = load_state()
-        date_str = today_str_ph()
-
-        di = int(st.get("day_index", 0))
-        p = generate_problem(di, date_str)
-
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["day_index"] = di + 1
-        st["last_posted_date"] = date_str
-        append_audit(st, {"action": "regen_today", "by": str(interaction.user), "day_index": di, "seed": p.get("seed"), "kind": p.get("kind")})
-        save_state(st)
-
-        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
-        if ch and isinstance(ch, discord.abc.Messageable):
-            await ch.send("⚙️ **DAILY MP DROP (regenerated / next in sequence):**", embed=build_embed(p))
-
-        await send_ephemeral(interaction, f"✅ Regenerated (next in sequence). seed={p.get('seed')} kind={p.get('kind')}")
-
-    @tree.command(name="repost_date", description="Admin: repost stored problem for a date (YYYY-MM-DD)")
-    @slash_admin_only()
-    @app_commands.describe(date="Date like 2026-02-13")
-    async def slash_repost_date(interaction: discord.Interaction, date: str):
-        st = load_state()
-        p = st.get("problems_by_date", {}).get(date)
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for that date.")
-            return
-        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
-        if ch is None or not isinstance(ch, discord.abc.Messageable):
-            await send_ephemeral(interaction, "❌ Daily channel not found.")
-            return
-        await ch.send(f"⚙️ **DAILY MP DROP (backfill {date}):**", embed=build_embed(p))
-        append_audit(st, {"action": "repost_date", "by": str(interaction.user), "date": date})
-        save_state(st)
-        await send_ephemeral(interaction, "✅ Reposted.")
-
-
-# =========================
-# PREFIX COMMANDS
+# PREFIX COMMANDS (ONLY)
 # =========================
 if ENABLE_PREFIX:
 
@@ -1528,6 +1331,17 @@ if ENABLE_PREFIX:
     @bot.command(name="ping")
     async def p_ping(ctx: commands.Context):
         await send_public(ctx, "pong")
+
+    @bot.command(name="rules")
+    async def p_rules(ctx: commands.Context):
+        await send_public(
+            ctx,
+            "**How to Submit (C++ only)**\n"
+            f"Use `{COMMAND_PREFIX}submit` and either:\n"
+            "1) Paste your full code after the command (you may include a ```cpp``` block), OR\n"
+            "2) Attach a `.cpp` file.\n\n"
+            "**No prompts** like `Enter n:` — output must match exactly."
+        )
 
     @bot.command(name="whoami")
     async def p_whoami(ctx: commands.Context):
@@ -1552,21 +1366,6 @@ if ENABLE_PREFIX:
             await send_public(ctx, f"❌ No problem stored for today yet. Ask admin to `{COMMAND_PREFIX}postnow` or wait for schedule.")
             return
         await send_public(ctx, embed=build_embed(p))
-
-    @bot.command(name="rules")
-    async def p_rules(ctx: commands.Context):
-        await send_public(
-            ctx,
-            "**How to Submit (C++ only)**\n"
-            f"Use `{COMMAND_PREFIX}submit` and either:\n"
-            "1) Paste your full code after the command (you may include a ```cpp``` block), OR\n"
-            "2) Attach a `.cpp` file.\n\n"
-            "**No prompts** like `Enter n:` — output must match exactly."
-        )
-
-    @bot.command(name="format")
-    async def p_format(ctx: commands.Context):
-        await p_rules(ctx)
 
     @bot.command(name="explain")
     async def p_explain(ctx: commands.Context):
@@ -1603,7 +1402,7 @@ if ENABLE_PREFIX:
         elif fam == "recursion":
             steps += ["2) Identify base case.", "3) Write recursive step.", "4) Call recursive function and print result."]
         else:
-            steps += ["2) Use the required topic tools (see `!explain`).", "3) Match output format exactly."]
+            steps += ["2) Use the required topic tools (see explain).", "3) Match output format exactly."]
         await send_public(ctx, "🧩 **Approach (today's problem)**\n" + "\n".join(steps))
 
     @bot.command(name="hint")
@@ -1722,8 +1521,9 @@ if ENABLE_PREFIX:
             ctx,
             "**Bot Status**\n"
             f"- Uptime: `{up}s`\n"
-            f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` | ENABLE_SLASH: `{ENABLE_SLASH}`\n"
+            f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` Prefix: `{COMMAND_PREFIX}`\n"
             f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}` (STRICT_ARRAYS={STRICT_ARRAYS}, STRICT_FUNCTIONS={STRICT_FUNCTIONS})\n"
+            f"- PLAGIARISM_ENABLED: `{PLAGIARISM_ENABLED}` threshold=`{PLAGIARISM_THRESHOLD}` hard_fail=`{PLAGIARISM_HARD_FAIL}`\n"
             f"- Day index: `{di}`\n"
             f"- Today stored: `{stored}` ({date_str})\n"
             f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
@@ -1779,17 +1579,17 @@ if ENABLE_PREFIX:
 
 
 # =========================
-# READY: SYNC + START TASKS
+# READY: START TASKS
 # =========================
 @bot.event
 async def on_ready():
     logging.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
     logging.info(
-        "Config: DAILY_CHANNEL_ID=%s SUBMIT_CHANNEL_ID=%s ENABLE_PREFIX=%s ENABLE_SLASH=%s ENFORCE_SKILLS=%s ADMIN_ROLES=%s",
+        "Config: DAILY_CHANNEL_ID=%s SUBMIT_CHANNEL_ID=%s ENABLE_PREFIX=%s PREFIX=%s ENFORCE_SKILLS=%s ADMIN_ROLES=%s",
         DAILY_CHANNEL_ID,
         SUBMIT_CHANNEL_ID,
         ENABLE_PREFIX,
-        ENABLE_SLASH,
+        COMMAND_PREFIX,
         ENFORCE_SKILLS,
         ADMIN_ROLES,
     )
@@ -1801,13 +1601,6 @@ async def on_ready():
         SUBMIT_COOLDOWN_SEC,
     )
     logging.info("Command System: prefix=%r message_content_intent(code)=%s", COMMAND_PREFIX, bot.intents.message_content)
-
-    if ENABLE_SLASH:
-        try:
-            await bot.tree.sync()
-            logging.info("Synced slash commands.")
-        except Exception as e:
-            logging.exception("Slash sync failed: %s", e)
 
     if not post_daily_problem.is_running():
         post_daily_problem.start()
