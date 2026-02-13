@@ -1,3 +1,15 @@
+# botted.py — CS1 Daily MP + C++ Judge (Windows/MSYS2-friendly)
+#
+# QoL + enforcement edition:
+# - Admin commands: !postnow, !reset_today, !status
+# - Student help: !rules / !format
+# - Anti-spam: per-user submit cooldown + code size limit
+# - Better WA feedback: first mismatch line + truncation
+# - Skill enforcement (heuristics) per problem family (toggle via ENFORCE_SKILLS)
+# - Attachment support: .cpp/.cc/.cxx and .txt containing C++ code blocks
+#
+# NOTE: This is still a heuristic checker. It enforces “use arrays / nested loops / recursion”
+# by scanning source text, not by AST parsing.
 
 from __future__ import annotations
 
@@ -12,15 +24,9 @@ import asyncio
 import tempfile
 import subprocess
 import time
-import shutil
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
 
-import discord
-from discord import app_commands
-from discord.ext import tasks, commands
-
-# ========= Your generators =========
 from problems.arrays_basic import gen_arrays_basic
 from problems.arrays_nested import gen_arrays_nested
 from problems.bool_checks import gen_bool_checks
@@ -32,6 +38,9 @@ from problems.recursion import gen_recursion
 from problems.stl_intro import gen_stl_intro
 
 from family_kinds import family_kinds
+
+import discord
+from discord.ext import tasks, commands
 
 # Optional: load .env for local runs (DON'T commit .env)
 try:
@@ -48,79 +57,57 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 TOKEN = os.getenv("DISCORD_TOKEN")  # required
 DAILY_CHANNEL_ID = int(os.getenv("DAILY_CHANNEL_ID", "0"))  # required
 SUBMIT_CHANNEL_ID = int(os.getenv("SUBMIT_CHANNEL_ID", "0"))  # optional; 0 = any channel
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-ENABLE_SLASH = os.getenv("ENABLE_SLASH", "true").strip().lower() in ("1", "true", "yes", "y", "on")
-ENABLE_PREFIX = os.getenv("ENABLE_PREFIX", "true").strip().lower() in ("1", "true", "yes", "y", "on")
-COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!").strip() or "!"
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
 # Philippines time (UTC+8). Daily post is at 09:00 AM PH time.
 PH_TZ = datetime.timezone(datetime.timedelta(hours=8))
 POST_TIME = datetime.time(hour=9, minute=0, tzinfo=PH_TZ)
 
-# Judge limits
+# Judge limits (override via env vars if you want)
 COMPILE_TIMEOUT_SEC = int(os.getenv("COMPILE_TIMEOUT_SEC", "12"))
 RUN_TIMEOUT_SEC = int(os.getenv("RUN_TIMEOUT_SEC", "2"))
 MAX_OUTPUT_BYTES = int(os.getenv("MAX_OUTPUT_BYTES", "64000"))
-MAX_RUN_MEMORY_MB = int(os.getenv("MAX_RUN_MEMORY_MB", "256"))
-MAX_RUN_NPROC = int(os.getenv("MAX_RUN_NPROC", "64"))
-MAX_RUN_CPU_SEC = int(os.getenv("MAX_RUN_CPU_SEC", "3"))
+
+# Code size limit (to avoid abuse)
 MAX_CODE_BYTES = int(os.getenv("MAX_CODE_BYTES", "100000"))  # ~100KB
 
+# Cooldown per user to avoid spam
 SUBMIT_COOLDOWN_SEC = int(os.getenv("SUBMIT_COOLDOWN_SEC", "15"))
-COOLDOWN_AFTER_ACCEPT_SEC = int(os.getenv("COOLDOWN_AFTER_ACCEPT_SEC", str(SUBMIT_COOLDOWN_SEC)))
-COOLDOWN_AFTER_FAIL_SEC = int(os.getenv("COOLDOWN_AFTER_FAIL_SEC", str(SUBMIT_COOLDOWN_SEC)))
 
+# Toggle skill enforcement quickly if you need to
 ENFORCE_SKILLS = os.getenv("ENFORCE_SKILLS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+
+# Tutor mode: allow more explicit guidance on hint3/3. Default is hints-only.
 TUTOR_FULL_CODE = os.getenv("TUTOR_FULL_CODE", "false").strip().lower() in ("1", "true", "yes", "y", "on")
 
+# Admin roles list (comma-separated). If empty, fall back to "Root Admin".
 ADMIN_ROLES = [r.strip() for r in os.getenv("ADMIN_ROLES", "Root Admin").split(",") if r.strip()]
 
-# g++ command
+# g++ command.
+# On Windows (MSYS2), set env var GPP to something like:
+#   C:\msys64\ucrt64\bin\g++.exe
 GPP = os.getenv("GPP", "g++")
+
 IS_WINDOWS = (os.name == "nt")
 
+# Only allow one submission to compile/run at a time (no overlaps)
 SUBMIT_LOCK = asyncio.Lock()
 
+# In-memory QoL state (resets on restart)
 BOT_START_MONO = time.monotonic()
-JUDGE_METRICS: Dict[str, int] = {
-    "submissions": 0,
-    "accepted": 0,
-    "compile_errors": 0,
-    "wrong_answers": 0,
-    "runtime_errors": 0,
-    "timeouts": 0,
-    "output_limit_exceeded": 0,
-}
-
-# Error codes
-ERR_CONFIG = "CFG001"
-ERR_NO_CODE = "SUB001"
-ERR_AMBIGUOUS_CODE = "SUB002"
-ERR_CODE_TOO_LARGE = "SUB003"
-ERR_COMPILE_TIMEOUT = "JDG101"
-ERR_COMPILE_FAIL = "JDG102"
-ERR_RUN_TIMEOUT = "JDG201"
-ERR_RUNTIME = "JDG202"
-ERR_WRONG_ANSWER = "JDG203"
-ERR_OUTPUT_LIMIT = "JDG204"
-
-SKILL_HARD_FAIL_CONFIDENCE = float(os.getenv("SKILL_HARD_FAIL_CONFIDENCE", "0.75"))
-SKILL_WARN_CONFIDENCE = float(os.getenv("SKILL_WARN_CONFIDENCE", "0.45"))
-HINTS_PER_DAY_LIMIT = int(os.getenv("HINTS_PER_DAY_LIMIT", "5"))
-
-BOT_UPDATES_VERSION = "2026-02-revised-hybrid"
+USER_LAST_SUBMIT: Dict[int, float] = {}
+USER_LAST_COMPILE_ERR: Dict[int, str] = {}
 
 # =========================
 # DISCORD BOT SETUP
 # =========================
 intents = discord.Intents.default()
-# Prefix commands need message_content to see messages
 intents.message_content = True
-
-bot = commands.Bot(command_prefix=(COMMAND_PREFIX if ENABLE_PREFIX else None), intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 def is_admin_member(member: discord.Member) -> bool:
+    # True if member has ANY role name in ADMIN_ROLES, or is guild admin.
     try:
         if member.guild_permissions.administrator:
             return True
@@ -128,9 +115,6 @@ def is_admin_member(member: discord.Member) -> bool:
         return any(ar in names for ar in ADMIN_ROLES)
     except Exception:
         return False
-
-def today_str_ph() -> str:
-    return datetime.datetime.now(PH_TZ).date().isoformat()
 
 def next_post_time_ph(now: Optional[datetime.datetime] = None) -> datetime.datetime:
     now = now or datetime.datetime.now(PH_TZ)
@@ -143,115 +127,21 @@ def next_post_time_ph(now: Optional[datetime.datetime] = None) -> datetime.datet
 # =========================
 # STATE HELPERS
 # =========================
-def default_state() -> dict:
-    return {
-        "day_index": 0,
-        "last_posted_date": None,
-        "problems_by_date": {},
-        "cooldowns": {},
-        "compile_errors": {},
-        "hint_usage": {},
-        "scores": {},
-        "audit_log": [],
-    }
-
-def _state_with_defaults(raw: dict) -> dict:
-    base = default_state()
-    base.update(raw or {})
-    for k in ("problems_by_date", "cooldowns", "compile_errors", "hint_usage", "scores"):
-        if not isinstance(base.get(k), dict):
-            base[k] = {}
-    if not isinstance(base.get("audit_log"), list):
-        base["audit_log"] = []
-    return base
-
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return default_state()
+        return {"day_index": 0, "last_posted_date": None, "problems_by_date": {}}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return _state_with_defaults(json.load(f))
+            return json.load(f)
     except Exception:
-        return default_state()
+        return {"day_index": 0, "last_posted_date": None, "problems_by_date": {}}
 
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
-def append_audit(state: dict, entry: dict) -> None:
-    logs = state.get("audit_log", [])
-    logs.append({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), **entry})
-    state["audit_log"] = logs[-250:]
-
-def cooldown_remaining_sec(state: dict, user_id: int) -> int:
-    key = str(user_id)
-    now = time.time()
-    until = float(state.get("cooldowns", {}).get(key, 0.0))
-    return max(0, int(until - now))
-
-def set_cooldown(state: dict, user_id: int, sec: int) -> None:
-    state.setdefault("cooldowns", {})[str(user_id)] = time.time() + max(0, sec)
-
-def record_compile_error(state: dict, user_id: int, msg: str) -> None:
-    state.setdefault("compile_errors", {})[str(user_id)] = {
-        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "msg": msg[:2000],
-    }
-
-def current_week_key_ph() -> str:
-    now = datetime.datetime.now(PH_TZ).date()
-    iso = now.isocalendar()
-    return f"{iso.year}-W{iso.week:02d}"
-
-def _score_row(state: dict, user_id: int, display: str) -> dict:
-    scores = state.setdefault("scores", {})
-    row = scores.get(str(user_id), {
-        "name": display,
-        "accepted": 0,
-        "submissions": 0,
-        "streak": 0,
-        "last_accept_date": None,
-        "week_key": current_week_key_ph(),
-        "weekly_accepts": 0,
-    })
-    row["name"] = display
-    if row.get("week_key") != current_week_key_ph():
-        row["week_key"] = current_week_key_ph()
-        row["weekly_accepts"] = 0
-    scores[str(user_id)] = row
-    return row
-
-def score_submission(state: dict, user_id: int, display: str, accepted: bool, date_str: str) -> None:
-    row = _score_row(state, user_id, display)
-    row["submissions"] += 1
-    if not accepted:
-        return
-    row["accepted"] += 1
-    row["weekly_accepts"] += 1
-    prev = row.get("last_accept_date")
-    if prev:
-        try:
-            prev_d = datetime.date.fromisoformat(prev)
-            cur_d = datetime.date.fromisoformat(date_str)
-            delta = (cur_d - prev_d).days
-            if delta == 1:
-                row["streak"] = int(row.get("streak", 0)) + 1
-            elif delta > 1:
-                row["streak"] = 1
-        except Exception:
-            row["streak"] = 1
-    else:
-        row["streak"] = 1
-    row["last_accept_date"] = date_str
-
-def consume_hint(state: dict, user_id: int, date_str: str) -> Tuple[bool, int]:
-    usage = state.setdefault("hint_usage", {})
-    per_user = usage.setdefault(str(user_id), {})
-    used = int(per_user.get(date_str, 0))
-    if used >= HINTS_PER_DAY_LIMIT:
-        return False, used
-    per_user[date_str] = used + 1
-    return True, used + 1
+def today_str_ph() -> str:
+    return datetime.datetime.now(PH_TZ).date().isoformat()
 
 # =========================
 # PROBLEM MODEL
@@ -266,8 +156,7 @@ def stable_seed_for_day(day_index: int, date_str: str) -> int:
     return int(h[:16], 16)
 
 def pick_family(day_index: int) -> str:
-    families = ["arrays_basic", "arrays_nested", "bool_checks", "functions", "patterns",
-                "strings", "math_logic", "recursion", "stl_intro"]
+    families = ["arrays_basic", "arrays_nested", "bool_checks", "functions", "patterns", "strings", "math_logic", "recursion", "stl_intro"]
     return families[day_index % len(families)]
 
 def normalize_output(s: str) -> str:
@@ -298,7 +187,7 @@ def generate_problem(day_index: int, date_str: str) -> dict:
         p = gen_math_logic(rng)
     elif family == "recursion":
         p = gen_recursion(rng)
-    else:
+    else:  # stl_intro
         p = gen_stl_intro(rng)
 
     p["day"] = date_str
@@ -329,65 +218,51 @@ def build_embed(problem: dict) -> discord.Embed:
         color=0x5865F2,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
+
     embed.add_field(name="Sample Input", value=f"```text\n{problem['sample_in']}```", inline=False)
     embed.add_field(name="Sample Output", value=f"```text\n{problem['sample_out']}```", inline=False)
 
-    how = []
-    if ENABLE_PREFIX:
-        how.append(f"Use `{COMMAND_PREFIX}submit` and paste your full C++ code (or attach a .cpp file).")
-    if ENABLE_SLASH:
-        how.append("Use `/submit` and paste your full C++ code (or attach a .cpp file).")
-    how.append("No prompts like `Enter n:` — output must match exactly.")
-    embed.add_field(name="How to Submit (C++ only)", value=" ".join(how), inline=False)
-
+    embed.add_field(
+        name="How to Submit (C++ only)",
+        value="Use `!submit` then paste your full C++ code in a ```cpp``` block (or attach a .cpp file). "
+              "No prompts like `Enter n:` — output must match exactly.",
+        inline=False,
+    )
     embed.set_footer(text=f"Day: {problem['day']} • Seed: {problem['seed']}")
     return embed
 
 # =========================
-# CODE EXTRACTION
+# JUDGE HELPERS
 # =========================
 CODE_BLOCK_RE = re.compile(r"```(?:cpp|c\+\+)?\s*([\s\S]*?)```", re.IGNORECASE)
 
-def extract_cpp_blocks(content: str) -> List[str]:
-    return [m.group(1).strip() for m in CODE_BLOCK_RE.finditer(content or "") if m.group(1).strip()]
+def extract_cpp_from_message(content: str) -> Optional[str]:
+    m = CODE_BLOCK_RE.search(content)
+    if not m:
+        return None
+    code = m.group(1).strip()
+    return code if code else None
 
-async def get_code_from_inputs(code_text: Optional[str], attachment: Optional[discord.Attachment]) -> Tuple[Optional[str], Optional[str]]:
-    candidates: List[Tuple[str, str]] = []
-
-    if code_text:
-        blocks = extract_cpp_blocks(code_text)
-        if blocks:
-            for i, b in enumerate(blocks, start=1):
-                candidates.append((f"code_text:block_{i}", b))
-        else:
-            candidates.append(("code_text:raw", code_text.strip()))
-
-    if attachment is not None:
-        fn = attachment.filename.lower()
+async def read_attachment_code(message: discord.Message) -> Optional[str]:
+    # Accept .cpp/.cc/.cxx and also .txt (common student mistake).
+    if not message.attachments:
+        return None
+    for att in message.attachments:
+        fn = att.filename.lower()
         if fn.endswith((".cpp", ".cc", ".cxx", ".txt")):
-            data = await attachment.read()
+            data = await att.read()
             text = data.decode("utf-8", errors="replace").strip()
-            blocks = extract_cpp_blocks(text)
-            if blocks:
-                for i, b in enumerate(blocks, start=1):
-                    candidates.append((f"attachment:{attachment.filename}:block_{i}", b))
-            elif text:
-                candidates.append((f"attachment:{attachment.filename}", text))
-
-    if not candidates:
-        return None, f"{ERR_NO_CODE}: I didn't find C++ code. Paste code or attach a .cpp file."
-    if len(candidates) > 1:
-        names = ", ".join(name for name, _ in candidates[:4])
-        suffix = "..." if len(candidates) > 4 else ""
-        return None, f"{ERR_AMBIGUOUS_CODE}: Found multiple code payloads ({names}{suffix}). Submit exactly one payload."
-    return candidates[0][1], None
+            # If they uploaded a .txt that contains a ```cpp``` block, prefer extracting it.
+            code = extract_cpp_from_message(text) or text
+            return code.strip() if code else None
+    return None
 
 def exe_path(workdir: str) -> str:
     return os.path.join(workdir, "main.exe" if IS_WINDOWS else "main.out")
 
-# =========================
-# BETTER DIFF UTILITIES
-# =========================
+# -------------------------
+# Better diff utilities
+# -------------------------
 def first_mismatch_line(expected: str, got: str) -> Tuple[int, str, str]:
     e_lines = expected.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     g_lines = got.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -405,68 +280,88 @@ def clamp_block(s: str, limit: int = 1200) -> str:
         return s
     return s[:limit] + "\n... (truncated)\n"
 
+
 # =========================
-# TUTOR HELPERS
+# TUTOR HELPERS (based on today's stored problem)
 # =========================
 def get_today_problem_from_state() -> Optional[dict]:
-    st = load_state()
+    state = load_state()
     date_str = today_str_ph()
-    return st.get("problems_by_date", {}).get(date_str)
+    return state.get("problems_by_date", {}).get(date_str)
 
 def _hint_bank(problem: dict) -> Dict[str, List[str]]:
+    """
+    Returns progressive hints for the current problem.
+    - If we know the exact problem id, you can extend this easily.
+    - Otherwise fall back to family-based hints.
+    """
     fam = str(problem.get("family", "")).lower()
+    pid = str(problem.get("id", "")).upper()
+
+    by_id: Dict[str, List[str]] = {
+        # Example: add specific ones later if you want.
+        # "AB_COUNT_EVEN": ["...", "...", "..."],
+    }
+
+    if pid in by_id:
+        return {pid: by_id[pid]}
+
     by_family: Dict[str, List[str]] = {
         "arrays_basic": [
             "Read **n**, then read **n numbers**. Store them in an array/vector so you can process them using `a[i]`.",
-            "Use `vector<long long> a(n); for (int i=0;i<n;i++) cin>>a[i];` then compute the required value in a loop.",
-            "Double-check you print **only** what the problem asks (no extra spaces/prompts)."
+            "Use a loop to fill `vector<long long> a(n)`, then another loop to compute the answer (count/sum/max/etc.).",
+            "Structure: `vector<long long> a(n); for i: cin>>a[i];` then process with `a[i]`.\n"
+            + ("(If your teacher allows: you can combine reading+processing, but here you should still store first.)" if not TUTOR_FULL_CODE else "")
         ],
         "arrays_nested": [
             "This one usually needs **nested loops** (a loop inside a loop) + an array/matrix.",
-            "If it's 2D: store inputs, then use `for (i) for (j)` to compute the required value.",
-            "Outer loop = rows, inner loop = columns. Avoid `map`/`unordered_map` if disallowed."
+            "If it's a 2D style task: store inputs, then use `for (i) for (j)` to compute the required value.",
+            "Look for the pattern: outer loop = rows/first index, inner loop = columns/second index. Avoid `map`/`unordered_map`."
         ],
         "bool_checks": [
-            "Compute the condition using comparisons (`<`, `>`, `==`, etc.).",
-            "Store it in `bool ok = (condition);` then print exactly what’s required (`YES/NO` or `1/0`).",
-            "Be careful with boundary cases (equal, negative, etc.)."
+            "Use comparisons (`<`, `>`, `==`, `!=`, etc.) and output the required boolean/decision result.",
+            "Keep it simple: compute a condition, store in `bool ok`, then print the required output format.",
+            "Common pattern: `bool ok = (condition);` then print `1/0` or `YES/NO` depending on the problem statement."
         ],
         "functions": [
             "Your instructor wants a **user-defined function** besides `main()`.",
-            "Write a helper function that does the core work, then call it from `main()`.",
-            "Keep I/O in `main()`, logic inside the function if possible."
+            "Write a function that does the core work (sum/count/max/etc.), then call it from `main()` and print the result.",
+            "Skeleton: `returnType fn(params){ ... }` then in `main`: read input → call `fn(...)` → print."
         ],
         "patterns": [
-            "Patterns are about **loops + printing**. Print line by line.",
-            "Figure out how many rows; outer loop controls rows; inner loop prints characters.",
-            "Print `\\n` after each row; don’t print extra lines."
+            "Patterns are about **loops + printing**. Don't store huge data; just print line by line.",
+            "Identify rows and columns. Usually outer loop controls rows, inner loop prints characters for that row.",
+            "Start with a small example: simulate row 1..n. Use `cout` inside loops, and print `\\n` per row."
         ],
         "strings": [
             "Use `string` / `getline` as required. Read input carefully (line vs token).",
-            "If processing characters: loop through the string and apply conditions.",
+            "If processing characters: loop through the string and apply conditions (`isalpha`, `isdigit`, etc.).",
             "Remember: `getline(cin, s)` reads spaces; `cin >> s` does not."
         ],
         "math_logic": [
-            "Write the math/formula first, then implement carefully. Watch integer division.",
-            "Test with small numbers and edge cases (0, 1, negatives if allowed).",
-            "Use `long long` if values can get large."
+            "Use arithmetic operators and/or loops based on the task (digits, primes, gcd, etc.).",
+            "Write the formula first, then implement it carefully. Watch for integer division.",
+            "Test with small numbers, then check edge cases (0, negatives if allowed, big values)."
         ],
         "recursion": [
-            "This requires a **recursive function** (it calls itself).",
-            "Define a base case that stops recursion, then reduce the input each call.",
-            "Avoid infinite recursion: make sure it progresses toward the base case."
+            "This problem requires a **recursive function** (it calls itself).",
+            "Define a clear base case that stops recursion. Then write the recursive step that reduces the problem size.",
+            "Template: `f(n) = ... f(n-1)` with base case like `n==0`/`n==1`."
         ],
         "stl_intro": [
-            "Use STL containers/algorithms (`vector`, `sort`, `set`, `map`) as required.",
-            "For ordering tasks, `vector + sort` is usually enough.",
-            "Make sure output formatting matches exactly."
+            "Use STL containers/algorithms (vector, set, map, sort, etc.) as required.",
+            "Prefer `vector` + `sort` for ordering tasks. For frequency, consider `map`/`unordered_map`.",
+            "Keep it standard: include `<bits/stdc++.h>` and use `std::` or `using namespace std;`."
         ],
     }
-    return {fam: by_family.get(fam, ["Read the problem carefully.", "Follow the I/O format exactly.", "Test using the sample I/O."])}
+
+    return {fam: by_family.get(fam, ["Read the problem carefully.", "Follow the input/output format exactly.", "Test using the sample I/O."])}
 
 def tutor_hints(problem: dict) -> List[str]:
     bank = _hint_bank(problem)
+    # return the first (and only) list in the dict
     return next(iter(bank.values()))
+
 
 # =========================
 # SKILL ENFORCEMENT (heuristics)
@@ -482,7 +377,7 @@ def _has_user_defined_function(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
     fn_pat = re.compile(
         r"(?mx)^\s*(?:template\s*<[^>]+>\s*)?"
-        r"(?:static\s+|inline\s+|constexpr\s+|friend\s+)?"
+        r"(?:static\s+|inline\s+|constexpr\s+|friend\s+)?*"
         r"(?:[\w:\<\>\,\&\*\s]+?)\s+"
         r"([A-Za-z_]\w*)\s*\([^;]*\)\s*(?:const\s*)?\{"
     )
@@ -491,20 +386,24 @@ def _has_user_defined_function(code: str) -> bool:
 
 def _has_array_usage(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
+
+    # container types
     has_vector = bool(re.search(r"\b(?:std::)?vector\s*<", code))
     has_array = bool(re.search(r"\b(?:std::)?array\s*<", code))
-    has_c_array_decl = bool(re.search(
-        r"\b(?:bool|char|short|int|long|long\s+long|float|double|string|std::string)\s+\w+\s*\[\s*\w*\s*\]\s*;",
-        code
-    ))
+    # C-style array declarations like: int a[100];  long long b[n];
+    has_c_array_decl = bool(re.search(r"\b(?:bool|char|short|int|long|long\s+long|float|double|string|std::string)\s+\w+\s*\[\s*\w*\s*\]\s*;", code))
+
+    # index access: a[i], a[i+1], etc.
     has_index = bool(re.search(r"\[[^\]]+\]", code))
+
     return (has_vector or has_array or has_c_array_decl) and has_index
 
 def _has_nested_loops(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    pat = re.compile(r"(for|while)\s*\([^\)]*\)\s*\{[\s\S]{0,800}?(for|while)\s*\(", re.MULTILINE)
+    pat = re.compile(r"(for|while)\s*\([^\)]*\)\s*\{[\s\S]{0,600}?(for|while)\s*\(", re.MULTILINE)
     if pat.search(code):
         return True
+    # fallback: at least 2 loops present (weak but helpful)
     return len(re.findall(r"\bfor\b|\bwhile\b", code)) >= 2
 
 def _has_bool_logic(code: str) -> bool:
@@ -519,6 +418,7 @@ def _has_pattern_printing(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
     has_loop = bool(re.search(r"\bfor\b|\bwhile\b", code))
     uses_cout = "cout" in code
+    # patterns: star or nested loops or repeated prints
     has_star_or_hash = ("*" in code) or ("#" in code)
     return has_loop and uses_cout and (has_star_or_hash or _has_nested_loops(code))
 
@@ -540,42 +440,42 @@ def _has_stl_usage(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
     return bool(re.search(r"\b(?:std::)?vector\s*<|\b(?:std::)?set\s*<|\b(?:std::)?map\s*<|\bunordered_map\s*<|\b(?:std::)?sort\s*\(", code))
 
-def enforce_skill(problem: dict, code: str) -> Tuple[bool, str, float]:
+def enforce_skill(problem: dict, code: str) -> Tuple[bool, str]:
     fam = str(problem.get("family", "")).lower()
 
     if fam == "arrays_basic":
         if not _has_array_usage(code):
-            return False, "❌ **ARRAYS (basic)**: I didn’t detect array/vector + indexing like `a[i]`.", 0.85
+            return False, "❌ **ARRAYS (basic)**: I didn’t detect array/vector + indexing like `a[i]`."
     elif fam == "arrays_nested":
         if not _has_array_usage(code):
-            return False, "❌ **ARRAYS (nested)**: I didn’t detect array/vector + indexing like `a[i]`.", 0.85
+            return False, "❌ **ARRAYS (nested)**: I didn’t detect array/vector + indexing like `a[i]`."
         if not _has_nested_loops(code):
-            return False, "❌ **ARRAYS (nested)**: I didn’t detect **nested loops** (e.g., `for` inside `for`).", 0.8
+            return False, "❌ **ARRAYS (nested)**: I didn’t detect **nested loops** (e.g., `for` inside `for`)."
         if re.search(r"\bmap\b|\bunordered_map\b", _strip_cpp_comments_and_strings(code)):
-            return False, "❌ **ARRAYS (nested)**: `map`/`unordered_map` not allowed. Use loops as required.", 0.95
+            return False, "❌ **ARRAYS (nested)**: `map`/`unordered_map` not allowed. Use loops as required."
     elif fam == "bool_checks":
         if not _has_bool_logic(code):
-            return False, "❌ **BOOL CHECKS**: I didn’t detect boolean logic (`bool`, comparisons, true/false).", 0.55
+            return False, "❌ **BOOL CHECKS**: I didn’t detect boolean logic (`bool`, comparisons, true/false)."
     elif fam == "functions":
         if not _has_user_defined_function(code):
-            return False, "❌ **FUNCTIONS**: Define at least one user-defined function (besides `main`).", 0.85
+            return False, "❌ **FUNCTIONS**: Define at least one user-defined function (besides `main`)."
     elif fam == "patterns":
         if not _has_pattern_printing(code):
-            return False, "❌ **PATTERNS**: Use loops to print the pattern (typically `cout` inside loops).", 0.5
+            return False, "❌ **PATTERNS**: Use loops to print the pattern (typically `cout` inside loops)."
     elif fam == "strings":
         if not _has_string_usage(code):
-            return False, "❌ **STRINGS**: Use `string`/`std::string` or `getline`.", 0.6
+            return False, "❌ **STRINGS**: Use `string`/`std::string` or `getline`."
     elif fam == "math_logic":
         if not _has_math_logic_ops(code):
-            return False, "❌ **MATH/LOGIC**: I didn’t detect typical math ops (`%`, arithmetic, etc.).", 0.4
+            return False, "❌ **MATH/LOGIC**: I didn’t detect typical math ops (`%`, arithmetic, etc.)."
     elif fam == "recursion":
         if not _has_recursion(code):
-            return False, "❌ **RECURSION**: I didn’t detect a recursive function (a function calling itself).", 0.9
+            return False, "❌ **RECURSION**: I didn’t detect a recursive function (a function calling itself)."
     elif fam == "stl_intro":
         if not _has_stl_usage(code):
-            return False, "❌ **STL INTRO**: Use STL (e.g., `vector`, `set`, `map`, or `sort`).", 0.75
+            return False, "❌ **STL INTRO**: Use STL (e.g., `vector`, `set`, `map`, or `sort`)."
 
-    return True, "", 1.0
+    return True, ""
 
 # =========================
 # SUBPROCESS + JUDGE
@@ -585,23 +485,10 @@ async def run_subprocess(
     stdin_data: Optional[bytes],
     timeout_sec: int,
     cwd: Optional[str] = None
-) -> Tuple[int, bytes, bytes, bool]:
+) -> Tuple[int, bytes, bytes]:
     creationflags = 0
     if IS_WINDOWS:
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
-    preexec = None
-    if not IS_WINDOWS:
-        def _limit_resources() -> None:
-            try:
-                import resource
-                mem = MAX_RUN_MEMORY_MB * 1024 * 1024
-                resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
-                resource.setrlimit(resource.RLIMIT_CPU, (MAX_RUN_CPU_SEC, MAX_RUN_CPU_SEC + 1))
-                resource.setrlimit(resource.RLIMIT_NPROC, (MAX_RUN_NPROC, MAX_RUN_NPROC))
-            except Exception:
-                pass
-        preexec = _limit_resources
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -610,13 +497,11 @@ async def run_subprocess(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         creationflags=creationflags,
-        preexec_fn=preexec,
     )
 
     try:
         out, err = await asyncio.wait_for(proc.communicate(stdin_data), timeout=timeout_sec)
-        truncated = (len(out) > MAX_OUTPUT_BYTES) or (len(err) > MAX_OUTPUT_BYTES)
-        return proc.returncode, out[:MAX_OUTPUT_BYTES], err[:MAX_OUTPUT_BYTES], truncated
+        return proc.returncode, out[:MAX_OUTPUT_BYTES], err[:MAX_OUTPUT_BYTES]
     except asyncio.TimeoutError:
         try:
             if IS_WINDOWS:
@@ -630,7 +515,7 @@ async def run_subprocess(
                 proc.kill()
         except Exception:
             pass
-        return -999, b"", b"TIMEOUT", False
+        return -999, b"", b"TIMEOUT"
 
 async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
     src = os.path.join(workdir, "main.cpp")
@@ -644,26 +529,26 @@ async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
     logging.info("JUDGE: compiler=%s", GPP)
     logging.info("JUDGE: compiling: %s", " ".join(cmd))
 
-    rc, out, err, _ = await run_subprocess(cmd, stdin_data=None, timeout_sec=COMPILE_TIMEOUT_SEC, cwd=workdir)
+    rc, out, err = await run_subprocess(cmd, stdin_data=None, timeout_sec=COMPILE_TIMEOUT_SEC, cwd=workdir)
 
     if rc == 0 and os.path.exists(exe):
         return True, ""
 
     if rc == -999:
-        return False, f"{ERR_COMPILE_TIMEOUT}: Compilation timed out."
+        return False, "Compilation timed out."
 
     msg = (out.decode("utf-8", errors="replace") + "\n" + err.decode("utf-8", errors="replace")).strip()
-    return False, (f"{ERR_COMPILE_FAIL}: " + msg) if msg else f"{ERR_COMPILE_FAIL}: Compilation failed (no output). Check that GPP points to g++."
+    return False, msg if msg else "Compilation failed (no output). Check that GPP points to g++."
 
 async def run_one_test(workdir: str, t: Dict[str, Any]) -> Tuple[bool, str, Optional[dict]]:
     exe = exe_path(workdir)
     inp = t["inp"].encode("utf-8")
     expected = normalize_output(t["out"])
 
-    rc, out, err, truncated = await run_subprocess([exe], stdin_data=inp, timeout_sec=RUN_TIMEOUT_SEC, cwd=workdir)
+    rc, out, err = await run_subprocess([exe], stdin_data=inp, timeout_sec=RUN_TIMEOUT_SEC, cwd=workdir)
 
     if rc == -999:
-        return False, f"{ERR_RUN_TIMEOUT}: Time Limit Exceeded", {"test": t, "kind": "timeout"}
+        return False, "Time Limit Exceeded", {"test": t}
 
     if rc != 0:
         msg = err.decode("utf-8", errors="replace").strip()
@@ -671,14 +556,11 @@ async def run_one_test(workdir: str, t: Dict[str, Any]) -> Tuple[bool, str, Opti
             msg = "Time Limit Exceeded"
         if not msg:
             msg = "Runtime Error"
-        return False, f"{ERR_RUNTIME}: Runtime Error (exit {rc})\n{msg}", {"test": t, "kind": "runtime"}
-
-    if truncated:
-        return False, f"{ERR_OUTPUT_LIMIT}: Output Limit Exceeded", {"test": t, "kind": "output_limit"}
+        return False, f"Runtime Error (exit {rc})\n{msg}", {"test": t}
 
     got = normalize_output(out.decode("utf-8", errors="replace"))
     if got != expected:
-        return False, f"{ERR_WRONG_ANSWER}: Wrong Answer", {"test": t, "expected": expected, "got": got, "kind": "wa"}
+        return False, "Wrong Answer", {"test": t, "expected": expected, "got": got}
 
     return True, "OK", None
 
@@ -692,7 +574,7 @@ async def post_daily_problem():
         return
 
     channel = bot.get_channel(DAILY_CHANNEL_ID)
-    if channel is None or not isinstance(channel, discord.abc.Messageable):
+    if channel is None:
         logging.warning("Daily channel not found. Check DAILY_CHANNEL_ID and permissions.")
         return
 
@@ -706,7 +588,7 @@ async def post_daily_problem():
     day_index = int(state.get("day_index", 0))
     problem = generate_problem(day_index, date_str)
 
-    await channel.send("⚙️ **DAILY MP DROP:** Solve it in C++ and submit.", embed=build_embed(problem))
+    await channel.send("⚙️ **DAILY MP DROP:** Solve it in C++ and submit with `!submit`.", embed=build_embed(problem))
 
     pb = state.get("problems_by_date", {})
     pb[date_str] = problem
@@ -722,523 +604,411 @@ async def before_post_daily():
     await bot.wait_until_ready()
     logging.info("CS1 Judge armed.")
 
-# =========================
-# STARTUP CHECKS
-# =========================
-def _die(msg: str) -> None:
-    raise RuntimeError(f"{ERR_CONFIG}: {msg}")
+@bot.event
+async def on_ready():
+    logging.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
 
-def validate_config() -> None:
-    if not TOKEN:
-        _die("DISCORD_TOKEN env var missing. Set DISCORD_TOKEN before running.")
-    if DAILY_CHANNEL_ID == 0:
-        _die("DAILY_CHANNEL_ID env var missing. Set DAILY_CHANNEL_ID before running.")
-    if COMPILE_TIMEOUT_SEC <= 0 or RUN_TIMEOUT_SEC <= 0:
-        _die("Timeout values must be positive integers.")
-    if MAX_CODE_BYTES <= 0:
-        _die("MAX_CODE_BYTES must be > 0.")
-    if not (shutil.which(GPP) or os.path.exists(GPP)):
-        logging.warning("%s: GPP binary not found on startup: %s", ERR_CONFIG, GPP)
+    # Startup config log (no token leak)
+    logging.info("Config: DAILY_CHANNEL_ID=%s SUBMIT_CHANNEL_ID=%s ENFORCE_SKILLS=%s ADMIN_ROLES=%s",
+                 DAILY_CHANNEL_ID, SUBMIT_CHANNEL_ID, ENFORCE_SKILLS, ADMIN_ROLES)
+    logging.info("Config: COMPILE_TIMEOUT=%ss RUN_TIMEOUT=%ss MAX_CODE_BYTES=%s COOLDOWN=%ss",
+                 COMPILE_TIMEOUT_SEC, RUN_TIMEOUT_SEC, MAX_CODE_BYTES, SUBMIT_COOLDOWN_SEC)
 
-# =========================
-# HELP TEXT
-# =========================
-def help_text() -> str:
-    parts = ["**📌 CS1 Daily MP Bot — Commands**\n"]
-    if ENABLE_PREFIX:
-        parts += [
-            f"**Prefix (Student)**\n"
-            f"• `{COMMAND_PREFIX}help` • `{COMMAND_PREFIX}ping` • `{COMMAND_PREFIX}today` • `{COMMAND_PREFIX}submit` • `{COMMAND_PREFIX}rules`\n"
-            f"• `{COMMAND_PREFIX}explain` • `{COMMAND_PREFIX}approach` • `{COMMAND_PREFIX}hint` • `{COMMAND_PREFIX}hint2` • `{COMMAND_PREFIX}hint3`\n"
-            f"• `{COMMAND_PREFIX}dryrun` • `{COMMAND_PREFIX}constraints` • `{COMMAND_PREFIX}leaderboard`\n\n"
-            f"**Prefix (Admin)**\n"
-            f"• `{COMMAND_PREFIX}status` • `{COMMAND_PREFIX}postnow` • `{COMMAND_PREFIX}reset_today` • `{COMMAND_PREFIX}regen_today` • `{COMMAND_PREFIX}repost_date YYYY-MM-DD`\n"
-            f"• `{COMMAND_PREFIX}dev help|list|random [family]|pick <family> <kind>|setup`\n"
-        ]
-    if ENABLE_SLASH:
-        parts += [
-            "\n**Slash (Student)**\n"
-            "• `/help` • `/ping` • `/today` • `/submit` • `/rules` • `/format` • `/explain` • `/approach`\n"
-            "• `/hint` • `/hint2` • `/hint3` • `/dryrun` • `/constraints` • `/leaderboard`\n\n"
-            "**Slash (Admin)**\n"
-            "• `/status` • `/postnow` • `/reset_today` • `/regen_today` • `/repost_date` • `/dev ...`\n"
-        ]
-    parts.append(f"\nBuild: `{BOT_UPDATES_VERSION}`")
-    return "".join(parts)
+    if not post_daily_problem.is_running():
+        post_daily_problem.start()
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    await ctx.send(f"❌ {type(error).__name__}: {error}")
 
 # =========================
-# SHARED “SEND” HELPERS
+# STUDENT COMMANDS
 # =========================
-async def send_ephemeral(interaction: discord.Interaction, content: str = "", *, embed: Optional[discord.Embed] = None) -> None:
-    if interaction.response.is_done():
-        await interaction.followup.send(content, embed=embed, ephemeral=True)
+@bot.command()
+async def ping(ctx: commands.Context):
+    await ctx.send("pong")
+
+@bot.command(name="today")
+async def today(ctx: commands.Context):
+    state = load_state()
+    date_str = today_str_ph()
+    p = state.get("problems_by_date", {}).get(date_str)
+    if not p:
+        await ctx.send("❌ No problem stored for today yet. Ask admin to `!postnow` or wait for schedule.")
+        return
+    await ctx.send(embed=build_embed(p))
+
+@bot.command(name="rules")
+async def rules(ctx: commands.Context):
+    await ctx.send(
+        "**How to Submit (C++ only)**\n"
+        "1) Type `!submit` and paste your full code inside a cpp block:\n"
+        "```cpp\n"
+        "#include <bits/stdc++.h>\n"
+        "using namespace std;\n"
+        "int main(){\n"
+        "  ios::sync_with_stdio(false);\n"
+        "  cin.tie(nullptr);\n"
+        "  // solve...\n"
+        "  return 0;\n"
+        "}\n"
+        "```\n"
+        "2) No extra prompts like `Enter n:`.\n"
+        "3) Output must match exactly.\n"
+    )
+
+@bot.command(name="format")
+async def format_cmd(ctx: commands.Context):
+    await rules(ctx)
+
+
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context):
+    # Custom help menu (student-friendly)
+    await ctx.send(
+        "**📌 Bot Commands**\n\n"
+        "**Student / Judge**\n"
+        "- `!today` → show today's problem again\n"
+        "- `!submit` → submit C++ code (paste in ```cpp``` or attach .cpp)\n"
+        "- `!rules` / `!format` → how to submit + format template\n\n"
+        "**Tutor (today's problem)**\n"
+        "- `!explain` → explain the topic for today's problem\n"
+        "- `!approach` → step-by-step approach (no full code by default)\n"
+        "- `!hint`, `!hint2`, `!hint3` → progressive hints\n"
+        "- `!dryrun` → walkthrough using sample input/output\n"
+        "- `!constraints` → constraints + edge cases\n\n"
+        "**Admin**\n"
+        "- `!status` → bot status\n"
+        "- `!postnow` → post today's problem now\n"
+        "- `!reset_today` → reset today's stored problem\n\n"
+        "**Dev (admin)**\n"
+        "- `!dev help` → dev command list\n"
+    )
+
+
+
+# =========================
+# TUTOR COMMANDS (based on today's problem)
+# =========================
+@bot.command(name="explain")
+async def explain_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    fam = str(p.get("family", "")).lower()
+    if fam.startswith("arrays"):
+        await ctx.send("🧠 **Arrays topic**: store input values in an array/vector and process using indexing like `a[i]`.")
+    elif fam == "functions":
+        await ctx.send("🧠 **Functions topic**: define at least one user-defined function (besides `main`) and call it from `main()`.")
+    elif fam == "recursion":
+        await ctx.send("🧠 **Recursion topic**: create a function that calls itself with a smaller input, with a clear base case.")
+    elif fam == "strings":
+        await ctx.send("🧠 **Strings topic**: use `string` / `getline` and process characters carefully (spaces vs tokens).")
+    elif fam == "patterns":
+        await ctx.send("🧠 **Patterns topic**: use loops to print output line-by-line; outer loop = rows, inner loop = columns.")
+    elif fam == "stl_intro":
+        await ctx.send("🧠 **STL topic**: use STL containers/algorithms like `vector`, `sort`, `set`, `map` as required.")
     else:
-        await interaction.response.send_message(content, embed=embed, ephemeral=True)
+        await ctx.send(f"🧠 Topic: **{fam}**. Follow the input/output format and apply the required concept.")
 
-async def send_public(ctx: commands.Context, content: str = "", *, embed: Optional[discord.Embed] = None) -> None:
-    await ctx.send(content, embed=embed)
+@bot.command(name="approach")
+async def approach_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    fam = str(p.get("family", "")).lower()
+    steps = []
+    steps.append("1) Read input exactly as specified.")
+    if fam == "arrays_basic":
+        steps += ["2) Store the n values in `vector<long long> a(n)`.", "3) Loop through `a[i]` to compute the required result.", "4) Print the result only (no prompts)."]
+    elif fam == "arrays_nested":
+        steps += ["2) Store the data (often 2D / multiple values).", "3) Use nested loops (`for` inside `for`) to compute.", "4) Print result only."]
+    elif fam == "functions":
+        steps += ["2) Write a helper function that solves the core task.", "3) Call it from `main()` and print the return value."]
+    elif fam == "recursion":
+        steps += ["2) Identify base case.", "3) Write recursive step reducing the problem size.", "4) Call the recursive function and print the result."]
+    else:
+        steps += ["2) Use the required topic tools (see `!explain`).", "3) Match output format exactly."]
+    await ctx.send("🧩 **Approach (today's problem)**\n" + "\n".join(steps))
+
+@bot.command(name="hint")
+async def hint_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    await ctx.send("💡 " + tutor_hints(p)[0])
+
+@bot.command(name="hint2")
+async def hint2_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    hints = tutor_hints(p)
+    await ctx.send("💡 " + (hints[1] if len(hints) > 1 else hints[0]))
+
+@bot.command(name="hint3")
+async def hint3_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    hints = tutor_hints(p)
+    msg = hints[2] if len(hints) > 2 else hints[-1]
+    if TUTOR_FULL_CODE:
+        msg += "\n\n✅ *(Tutor mode)* `TUTOR_FULL_CODE=true` is enabled, so hints may be more explicit."
+    await ctx.send("💡 " + msg)
+
+@bot.command(name="dryrun")
+async def dryrun_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    await ctx.send(
+        "🧪 **Sample Dry Run**\n"
+        f"**Sample Input**\n```text\n{p.get('sample_in','')}```"
+        f"**Sample Output**\n```text\n{p.get('sample_out','')}```"
+        "Try to reproduce the sample output exactly."
+    )
+
+@bot.command(name="constraints")
+async def constraints_cmd(ctx: commands.Context):
+    p = get_today_problem_from_state()
+    if not p:
+        await ctx.send("❌ No stored problem for today yet. Ask admin to `!postnow`.")
+        return
+    await ctx.send(f"📌 **Constraints**\n{p.get('constraints','-')}")
 
 # =========================
-# SHARED SUBMISSION PIPELINE
+# ADMIN COMMANDS
 # =========================
-async def judge_submission(
-    *,
-    user_id: int,
-    user_display: str,
-    channel_id: int,
-    code_text: Optional[str],
-    attachment: Optional[discord.Attachment],
-    progress_cb,   # async callable(str)
-    result_cb      # async callable(str)
-) -> None:
-    # channel restriction
-    if SUBMIT_CHANNEL_ID and channel_id != SUBMIT_CHANNEL_ID:
-        if SUBMIT_CHANNEL_ID != DAILY_CHANNEL_ID:
-            await result_cb(f"❌ Submit only in <#{SUBMIT_CHANNEL_ID}>.")
-            return
-
-    if SUBMIT_LOCK.locked():
-        await result_cb("⏳ Another submission is being judged right now. Please try again in a moment.")
+@bot.command(name="status")
+async def status(ctx: commands.Context):
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
         return
 
+    state = load_state()
+    date_str = today_str_ph()
+    stored = date_str in state.get("problems_by_date", {})
+    di = int(state.get("day_index", 0))
+    up = int(time.monotonic() - BOT_START_MONO)
+    nxt = next_post_time_ph()
+
+    await ctx.send(
+        "**Bot Status**\n"
+        f"- Uptime: `{up}s`\n"
+        f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
+        f"- Day index: `{di}`\n"
+        f"- Today stored: `{stored}` ({date_str})\n"
+        f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
+        f"- DAILY_CHANNEL_ID: `{DAILY_CHANNEL_ID}`\n"
+        f"- SUBMIT_CHANNEL_ID: `{SUBMIT_CHANNEL_ID}`\n"
+        f"- GPP: `{GPP}`\n"
+    )
+
+@bot.command(name="postnow")
+async def postnow(ctx: commands.Context):
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
+        return
+
+    if DAILY_CHANNEL_ID == 0:
+        await ctx.send("❌ DAILY_CHANNEL_ID not set.")
+        return
+
+    channel = bot.get_channel(DAILY_CHANNEL_ID)
+    if channel is None:
+        await ctx.send("❌ Daily channel not found. Check DAILY_CHANNEL_ID.")
+        return
+
+    state = load_state()
+    date_str = today_str_ph()
+
+    existing = state.get("problems_by_date", {}).get(date_str)
+    if existing:
+        await channel.send("⚙️ **DAILY MP DROP (repost):**", embed=build_embed(existing))
+        await ctx.send("✅ Reposted the already-stored problem for today.")
+        return
+
+    day_index = int(state.get("day_index", 0))
+    problem = generate_problem(day_index, date_str)
+
+    await channel.send("⚙️ **DAILY MP DROP (manual):** Solve it in C++ and submit with `!submit`.", embed=build_embed(problem))
+
+    pb = state.get("problems_by_date", {})
+    pb[date_str] = problem
+    state["problems_by_date"] = pb
+    state["day_index"] = day_index + 1
+    state["last_posted_date"] = date_str
+    save_state(state)
+
+    await ctx.send(f"✅ Posted today’s problem to <#{DAILY_CHANNEL_ID}> (day_index was {day_index}).")
+
+@bot.command(name="reset_today")
+async def reset_today(ctx: commands.Context):
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
+        return
+
+    state = load_state()
+    date_str = today_str_ph()
+    pb = state.get("problems_by_date", {})
+
+    if date_str not in pb:
+        await ctx.send("✅ Nothing to reset for today (no stored problem).")
+        return
+
+    # Remove today's problem
+    pb.pop(date_str, None)
+    state["problems_by_date"] = pb
+    state["last_posted_date"] = None  # allow schedule to post again
+
+    # Do NOT decrement day_index automatically (can cause repeats). Keep simple.
+    save_state(state)
+    await ctx.send("✅ Reset done. Use `!postnow` to post a new problem for today.")
+
+# =========================
+# SUBMIT COMMAND
+# =========================
+@bot.command(name="submit")
+async def submit(ctx: commands.Context):
+    # If another submission is running, give quick feedback before waiting.
+    if SUBMIT_LOCK.locked():
+        await ctx.send("⏳ Another submission is being judged right now. Your turn is next—please wait.")
     async with SUBMIT_LOCK:
-        st = load_state()
-
-        rem = cooldown_remaining_sec(st, user_id)
-        if rem > 0:
-            await result_cb(f"⏳ Cooldown: wait `{rem}s` before submitting again.")
-            return
-
-        date_str = today_str_ph()
-        problem = st.get("problems_by_date", {}).get(date_str)
-        if not problem:
-            await result_cb("❌ No active problem for today. Ask admin to post today’s MP.")
-            return
-
-        src, parse_err = await get_code_from_inputs(code_text, attachment)
-        if parse_err:
-            await result_cb(f"❌ {parse_err}")
-            return
-        if not src:
-            await result_cb(f"❌ {ERR_NO_CODE}: No code payload found.")
-            return
-
-        if len(src.encode("utf-8", errors="ignore")) > MAX_CODE_BYTES:
-            await result_cb(f"❌ {ERR_CODE_TOO_LARGE}: Code too large. Limit is {MAX_CODE_BYTES} bytes.")
-            return
-
-        if re.search(r'cout\s*<<\s*".*(enter|input|please)', src, flags=re.IGNORECASE):
-            await progress_cb("⚠️ Heads up: prompts like `Enter n:` often cause Wrong Answer. Output should be answer only.")
-
-        if ENFORCE_SKILLS:
-            ok_skill, skill_msg, confidence = enforce_skill(problem, src)
-            if not ok_skill and confidence >= SKILL_HARD_FAIL_CONFIDENCE:
-                await result_cb(skill_msg + f"\n(Confidence: {confidence:.2f}. Teacher: set `ENFORCE_SKILLS=false` to disable.)")
+        # Channel restriction
+        if SUBMIT_CHANNEL_ID and ctx.channel.id != SUBMIT_CHANNEL_ID:
+            if SUBMIT_CHANNEL_ID != DAILY_CHANNEL_ID:
+                await ctx.send(f"❌ Submit only in <#{SUBMIT_CHANNEL_ID}>.")
                 return
-            if not ok_skill and confidence >= SKILL_WARN_CONFIDENCE:
-                await progress_cb(f"⚠️ Skill-check warning (confidence {confidence:.2f}): {skill_msg}")
+
+        # Cooldown
+        uid = ctx.author.id
+        now = time.monotonic()
+        last = USER_LAST_SUBMIT.get(uid, 0.0)
+        if (now - last) < SUBMIT_COOLDOWN_SEC:
+            wait = int(SUBMIT_COOLDOWN_SEC - (now - last))
+            await ctx.send(f"⏳ Cooldown: wait `{wait}s` before submitting again.")
+            return
+        USER_LAST_SUBMIT[uid] = now
+
+        state = load_state()
+        date_str = today_str_ph()
+        problem = state.get("problems_by_date", {}).get(date_str)
+        if not problem:
+            await ctx.send("❌ No active problem for today. Ask admin to `!postnow`.")
+            return
+
+        msg: discord.Message = ctx.message
+
+        code = await read_attachment_code(msg)
+        if not code:
+            code = extract_cpp_from_message(msg.content)
+
+        if not code:
+            await ctx.send("❌ I didn't find C++ code. Paste it inside a ```cpp``` block or attach a .cpp file.")
+            return
+
+        # Code size limit
+        if len(code.encode("utf-8", errors="ignore")) > MAX_CODE_BYTES:
+            await ctx.send(f"❌ Code too large. Limit is {MAX_CODE_BYTES} bytes.")
+            return
+
+        # Prompt warnings (common)
+        if re.search(r'cout\s*<<\s*".*(enter|input|please)', code, flags=re.IGNORECASE):
+            await ctx.send("⚠️ Heads up: prompts like `Enter n:` often cause Wrong Answer. Output should be answer only.")
+
+        # Skill enforcement
+        if ENFORCE_SKILLS:
+            ok_skill, skill_msg = enforce_skill(problem, code)
+            if not ok_skill:
+                await ctx.send(skill_msg + "\n(Teacher: set `ENFORCE_SKILLS=false` to disable enforcement.)")
+                return
 
         tests = problem.get("tests", [])
-        await progress_cb("🧪 Compiling...")
-        JUDGE_METRICS["submissions"] += 1
+        status_msg = await ctx.send("🧪 Compiling...")
 
         with tempfile.TemporaryDirectory(prefix="cs1judge_") as workdir:
-            ok, cerr = await compile_cpp(src, workdir)
+            ok, cerr = await compile_cpp(code, workdir)
             if not ok:
                 cerr = cerr.strip()
-                record_compile_error(st, user_id, cerr)
-                JUDGE_METRICS["compile_errors"] += 1
-                set_cooldown(st, user_id, COOLDOWN_AFTER_FAIL_SEC)
-                score_submission(st, user_id, user_display, accepted=False, date_str=date_str)
-                save_state(st)
-
-                short = cerr[:1800] + ("\n... (truncated)" if len(cerr) > 1800 else "")
-                await result_cb(f"❌ {ERR_COMPILE_FAIL}: Compilation Error\n```text\n{short}\n```")
+                USER_LAST_COMPILE_ERR[uid] = cerr
+                short = cerr
+                if len(short) > 1800:
+                    short = short[:1800] + "\n... (truncated)"
+                await status_msg.edit(content="❌ Compilation Error")
+                await ctx.send(f"```text\n{short}\n```")
                 return
 
-            await progress_cb(f"✅ Compiled. Running tests (0/{len(tests)})...")
+            await status_msg.edit(content=f"✅ Compiled. Running tests (0/{len(tests)})...")
 
             for i, t in enumerate(tests, start=1):
+                await status_msg.edit(content=f"🏃 Running tests ({i}/{len(tests)})...")
                 passed, verdict, details = await run_one_test(workdir, t)
                 if not passed:
-                    kind = (details or {}).get("kind")
-                    if kind == "wa":
-                        JUDGE_METRICS["wrong_answers"] += 1
-                    elif kind == "runtime":
-                        JUDGE_METRICS["runtime_errors"] += 1
-                    elif kind == "timeout":
-                        JUDGE_METRICS["timeouts"] += 1
-                    elif kind == "output_limit":
-                        JUDGE_METRICS["output_limit_exceeded"] += 1
+                    await status_msg.edit(content=f"❌ {verdict} — failed test #{i}")
 
-                    set_cooldown(st, user_id, COOLDOWN_AFTER_FAIL_SEC)
-                    score_submission(st, user_id, user_display, accepted=False, date_str=date_str)
-                    save_state(st)
-
-                    msg = f"❌ {verdict} — failed test #{i}\n"
                     tinp = details["test"]["inp"] if details and "test" in details else ""
-                    if details and (details.get("kind") == "wa"):
+
+                    if verdict == "Wrong Answer" and details:
                         exp = details["expected"]
                         got = details["got"]
+
                         line_no, e_line, g_line = first_mismatch_line(exp, got)
-                        msg += (
+
+                        msg_out = (
                             f"**Input**\n```text\n{clamp_block(tinp, 900)}```"
                             f"**Expected**\n```text\n{clamp_block(exp, 900)}```"
                             f"**Got**\n```text\n{clamp_block(got, 900)}```"
                         )
                         if line_no:
-                            msg += f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
+                            msg_out += f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
+                        await ctx.send(msg_out)
                     else:
                         if tinp:
-                            msg += f"**Input**\n```text\n{clamp_block(tinp, 1200)}```"
-                    await result_cb(msg)
+                            await ctx.send(f"**Input**\n```text\n{clamp_block(tinp, 1200)}```")
                     return
 
-            JUDGE_METRICS["accepted"] += 1
-            set_cooldown(st, user_id, COOLDOWN_AFTER_ACCEPT_SEC)
-            score_submission(st, user_id, user_display, accepted=True, date_str=date_str)
-            save_state(st)
-
-            await result_cb(f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.\nProblem: **{problem['title']}** (Day {problem['day']})")
+            await status_msg.edit(content=f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.")
+            await ctx.send(f"Problem: **{problem['title']}** (Day {problem['day']})")
 
 # =========================
-# SLASH COMMANDS
+# DEV COMMANDS (Teacher tools)
 # =========================
-if ENABLE_SLASH:
-    tree = bot.tree
+@bot.command(name="dev")
+async def dev(ctx: commands.Context, action: str, family: Optional[str] = None, kind: Optional[str] = None):
+    # Admin-only dev command bundle.
+    if not isinstance(ctx.author, discord.Member) or not is_admin_member(ctx.author):
+        await ctx.send("❌ Admin only.")
+        return
 
-    def admin_only():
-        async def predicate(interaction: discord.Interaction) -> bool:
-            if not interaction.guild or not isinstance(interaction.user, discord.Member):
-                return False
-            return is_admin_member(interaction.user)
-        return app_commands.check(predicate)
+    state = load_state()
+    date_str = today_str_ph()
+    action = action.lower().strip()
 
-    @tree.command(name="help", description="Show all bot commands")
-    async def slash_help(interaction: discord.Interaction):
-        await send_ephemeral(interaction, help_text())
-
-    @tree.command(name="ping", description="Bot check")
-    async def slash_ping(interaction: discord.Interaction):
-        await send_ephemeral(interaction, "pong")
-
-    @tree.command(name="today", description="Show today's problem")
-    async def slash_today(interaction: discord.Interaction):
-        st = load_state()
-        date_str = today_str_ph()
-        p = st.get("problems_by_date", {}).get(date_str)
-        if not p:
-            await send_ephemeral(interaction, "❌ No problem stored for today yet. Ask admin to `/postnow` or wait for schedule.")
-            return
-        # embed should be public by default; keep not-ephemeral so classmates can see
-        await interaction.response.send_message(embed=build_embed(p))
-
-    @tree.command(name="rules", description="Show how to submit")
-    async def slash_rules(interaction: discord.Interaction):
-        await send_ephemeral(
-            interaction,
-            "**How to Submit (C++ only)**\n"
-            "Use `/submit` and either:\n"
-            "1) Paste your full code in the `code` field (you may include a ```cpp``` block), OR\n"
-            "2) Attach a `.cpp` file.\n\n"
-            "**No prompts** like `Enter n:` — output must match exactly."
-        )
-
-    @tree.command(name="format", description="Alias for /rules")
-    async def slash_format(interaction: discord.Interaction):
-        await slash_rules(interaction)
-
-    @tree.command(name="explain", description="Explain today's topic")
-    async def slash_explain(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        fam = str(p.get("family", "")).lower()
-        if fam.startswith("arrays"):
-            msg = "🧠 **Arrays**: store input values in an array/vector and process using indexing like `a[i]`."
-        elif fam == "functions":
-            msg = "🧠 **Functions**: define at least one user-defined function (besides `main`) and call it from `main()`."
-        elif fam == "recursion":
-            msg = "🧠 **Recursion**: create a function that calls itself with a smaller input, with a clear base case."
-        elif fam == "strings":
-            msg = "🧠 **Strings**: use `string` / `getline` and handle spaces vs tokens carefully."
-        elif fam == "patterns":
-            msg = "🧠 **Patterns**: use loops to print line-by-line; outer loop = rows, inner loop = columns."
-        elif fam == "stl_intro":
-            msg = "🧠 **STL**: use `vector`, `sort`, `set`, `map`, etc. as required."
-        else:
-            msg = f"🧠 Topic: **{fam}**. Follow the input/output format and apply the required concept."
-        await send_ephemeral(interaction, msg)
-
-    @tree.command(name="approach", description="Suggested steps for today's MP")
-    async def slash_approach(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        fam = str(p.get("family", "")).lower()
-        steps = ["1) Read input exactly as specified."]
-        if fam == "arrays_basic":
-            steps += ["2) Store the n values in `vector<long long> a(n)`.",
-                      "3) Loop through `a[i]` to compute the required result.",
-                      "4) Print the result only (no prompts)."]
-        elif fam == "arrays_nested":
-            steps += ["2) Store the data (often 2D / multiple values).",
-                      "3) Use nested loops (`for` inside `for`) to compute.",
-                      "4) Print result only."]
-        elif fam == "functions":
-            steps += ["2) Write a helper function that solves the core task.",
-                      "3) Call it from `main()` and print the return value."]
-        elif fam == "recursion":
-            steps += ["2) Identify base case.", "3) Write recursive step reducing the problem size.",
-                      "4) Call the recursive function and print the result."]
-        else:
-            steps += ["2) Use the required topic tools (see `/explain`).", "3) Match output format exactly."]
-        await send_ephemeral(interaction, "🧩 **Approach (today's problem)**\n" + "\n".join(steps))
-
-    @tree.command(name="hint", description="Get hint 1 (limited per day)")
-    async def slash_hint(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        st = load_state()
-        ok, used = consume_hint(st, interaction.user.id, today_str_ph())
-        if not ok:
-            await send_ephemeral(interaction, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
-            return
-        save_state(st)
-        await send_ephemeral(interaction, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {tutor_hints(p)[0]}")
-
-    @tree.command(name="hint2", description="Get hint 2 (limited per day)")
-    async def slash_hint2(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        st = load_state()
-        ok, used = consume_hint(st, interaction.user.id, today_str_ph())
-        if not ok:
-            await send_ephemeral(interaction, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
-            return
-        save_state(st)
-        hints = tutor_hints(p)
-        await send_ephemeral(interaction, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {hints[1] if len(hints) > 1 else hints[0]}")
-
-    @tree.command(name="hint3", description="Get hint 3 (limited per day)")
-    async def slash_hint3(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        st = load_state()
-        ok, used = consume_hint(st, interaction.user.id, today_str_ph())
-        if not ok:
-            await send_ephemeral(interaction, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
-            return
-        save_state(st)
-        hints = tutor_hints(p)
-        msg = hints[2] if len(hints) > 2 else hints[-1]
-        if TUTOR_FULL_CODE:
-            msg += "\n\n✅ *(Tutor mode)* `TUTOR_FULL_CODE=true` is enabled."
-        await send_ephemeral(interaction, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {msg}")
-
-    @tree.command(name="dryrun", description="Show sample input/output again")
-    async def slash_dryrun(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        await send_ephemeral(
-            interaction,
-            "🧪 **Sample Dry Run**\n"
-            f"**Sample Input**\n```text\n{p.get('sample_in','')}```"
-            f"**Sample Output**\n```text\n{p.get('sample_out','')}```"
-        )
-
-    @tree.command(name="constraints", description="Show constraints for today's MP")
-    async def slash_constraints(interaction: discord.Interaction):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for today yet. Ask admin to `/postnow`.")
-            return
-        await send_ephemeral(interaction, f"📌 **Constraints**\n{p.get('constraints','-')}")
-
-    @tree.command(name="leaderboard", description="Show weekly leaderboard")
-    async def slash_leaderboard(interaction: discord.Interaction):
-        st = load_state()
-        rows = list(st.get("scores", {}).values())
-        if not rows:
-            await send_ephemeral(interaction, "No leaderboard data yet.")
-            return
-        rows.sort(key=lambda r: (int(r.get("weekly_accepts", 0)), int(r.get("accepted", 0))), reverse=True)
-        lines = ["🏆 **Weekly Leaderboard**"]
-        for i, r in enumerate(rows[:10], start=1):
-            lines.append(f"{i}. **{r.get('name','user')}** — weekly `{r.get('weekly_accepts',0)}` | total `{r.get('accepted',0)}` | streak `{r.get('streak',0)}`")
-        await interaction.response.send_message("\n".join(lines))
-
-    # ---- SLASH: SUBMIT ----
-    @tree.command(name="submit", description="Submit your C++ solution (paste code or attach .cpp)")
-    @app_commands.describe(
-        code="Paste your full C++ code here (optional if you attach a file)",
-        file="Attach a .cpp/.cc/.cxx/.txt file (optional if you paste code)"
-    )
-    async def slash_submit(interaction: discord.Interaction, code: Optional[str] = None, file: Optional[discord.Attachment] = None):
-        async def progress(msg: str):
-            await send_ephemeral(interaction, msg)
-
-        async def result(msg: str):
-            await send_ephemeral(interaction, msg)
-
-        # acknowledge quickly so Discord doesn't time out
-        await send_ephemeral(interaction, "✅ Submission received. Starting judge...")
-
-        channel_id = interaction.channel.id if interaction.channel else 0
-        await judge_submission(
-            user_id=interaction.user.id,
-            user_display=str(interaction.user),
-            channel_id=channel_id,
-            code_text=code,
-            attachment=file,
-            progress_cb=progress,
-            result_cb=result,
-        )
-
-    # ---- SLASH: ADMIN ----
-    @tree.command(name="status", description="Admin: show bot status/metrics")
-    @admin_only()
-    async def slash_status(interaction: discord.Interaction):
-        st = load_state()
-        date_str = today_str_ph()
-        stored = date_str in st.get("problems_by_date", {})
-        di = int(st.get("day_index", 0))
-        up = int(time.monotonic() - BOT_START_MONO)
-        nxt = next_post_time_ph()
-
-        await send_ephemeral(
-            interaction,
-            "**Bot Status**\n"
-            f"- Uptime: `{up}s`\n"
-            f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` | ENABLE_SLASH: `{ENABLE_SLASH}`\n"
-            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
-            f"- Day index: `{di}`\n"
-            f"- Today stored: `{stored}` ({date_str})\n"
-            f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
-            f"- Queue busy: `{SUBMIT_LOCK.locked()}`\n"
-            f"- DAILY_CHANNEL_ID: `{DAILY_CHANNEL_ID}`\n"
-            f"- SUBMIT_CHANNEL_ID: `{SUBMIT_CHANNEL_ID}`\n"
-            f"- GPP: `{GPP}` exists=`{bool(shutil.which(GPP) or os.path.exists(GPP))}`\n"
-            f"- Metrics: `{JUDGE_METRICS}`\n"
-            f"- Build: `{BOT_UPDATES_VERSION}`\n"
-        )
-
-    @tree.command(name="postnow", description="Admin: post today's problem now")
-    @admin_only()
-    async def slash_postnow(interaction: discord.Interaction):
-        if DAILY_CHANNEL_ID == 0:
-            await send_ephemeral(interaction, "❌ DAILY_CHANNEL_ID not set.")
-            return
-        ch = bot.get_channel(DAILY_CHANNEL_ID)
-        if ch is None or not isinstance(ch, discord.abc.Messageable):
-            await send_ephemeral(interaction, "❌ Daily channel not found. Check DAILY_CHANNEL_ID.")
-            return
-
-        st = load_state()
-        date_str = today_str_ph()
-        existing = st.get("problems_by_date", {}).get(date_str)
-        if existing:
-            await ch.send("⚙️ **DAILY MP DROP (repost):**", embed=build_embed(existing))
-            await send_ephemeral(interaction, "✅ Reposted the already-stored problem for today.")
-            return
-
-        di = int(st.get("day_index", 0))
-        p = generate_problem(di, date_str)
-
-        await ch.send("⚙️ **DAILY MP DROP (manual):** Solve it in C++ and submit.", embed=build_embed(p))
-
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["day_index"] = di + 1
-        st["last_posted_date"] = date_str
-        save_state(st)
-
-        await send_ephemeral(interaction, f"✅ Posted today’s problem to <#{DAILY_CHANNEL_ID}> (day_index was {di}).")
-
-    @tree.command(name="reset_today", description="Admin: reset today's stored problem")
-    @admin_only()
-    async def slash_reset_today(interaction: discord.Interaction):
-        st = load_state()
-        date_str = today_str_ph()
-        pb = st.get("problems_by_date", {})
-
-        if date_str not in pb:
-            await send_ephemeral(interaction, "✅ Nothing to reset for today (no stored problem).")
-            return
-
-        pb.pop(date_str, None)
-        st["problems_by_date"] = pb
-        st["last_posted_date"] = None
-        save_state(st)
-        await send_ephemeral(interaction, "✅ Reset done. Use `/postnow` to post a new problem for today.")
-
-    @tree.command(name="regen_today", description="Admin: regenerate today's problem (new seed)")
-    @admin_only()
-    async def slash_regen_today(interaction: discord.Interaction):
-        st = load_state()
-        date_str = today_str_ph()
-        di = int(st.get("day_index", 0))
-        p = generate_problem(di, date_str)
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["day_index"] = di + 1
-        st["last_posted_date"] = date_str
-        append_audit(st, {"action": "regen_today", "by": str(interaction.user), "day_index": di, "seed": p.get("seed")})
-        save_state(st)
-
-        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
-        if ch and isinstance(ch, discord.abc.Messageable):
-            await ch.send("⚙️ **DAILY MP DROP (regenerated):**", embed=build_embed(p))
-
-        await send_ephemeral(interaction, f"✅ Regenerated today's problem (seed={p.get('seed')}).")
-
-    @tree.command(name="repost_date", description="Admin: repost stored problem for a date (YYYY-MM-DD)")
-    @admin_only()
-    @app_commands.describe(date="Date like 2026-02-13")
-    async def slash_repost_date(interaction: discord.Interaction, date: str):
-        st = load_state()
-        p = st.get("problems_by_date", {}).get(date)
-        if not p:
-            await send_ephemeral(interaction, "❌ No stored problem for that date.")
-            return
-        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
-        if ch is None or not isinstance(ch, discord.abc.Messageable):
-            await send_ephemeral(interaction, "❌ Daily channel not found.")
-            return
-        await ch.send(f"⚙️ **DAILY MP DROP (backfill {date}):**", embed=build_embed(p))
-        append_audit(st, {"action": "repost_date", "by": str(interaction.user), "date": date})
-        save_state(st)
-        await send_ephemeral(interaction, "✅ Reposted.")
-
-    # ---- SLASH: DEV GROUP ----
-    dev = app_commands.Group(name="dev", description="Admin: dev tools")
-
-    @dev.command(name="help", description="Show dev commands")
-    @admin_only()
-    async def dev_help(interaction: discord.Interaction):
-        await send_ephemeral(
-            interaction,
+    if action == "help":
+        await ctx.send(
             "**DEV COMMANDS:**\n"
-            "`/dev list` → list all families/kinds\n"
-            "`/dev random [family]` → pick random problem\n"
-            "`/dev pick <family> <kind>` → pick specific problem\n"
-            "`/dev setup` → show runtime config\n"
+            "`!dev list` → list all families/kinds\n"
+            "`!dev random [family]` → pick random problem\n"
+            "`!dev pick <family> <kind>` → pick specific problem\n"
+            "`!dev submit` → judge your code in this channel (admin testing)\n"
+            "`!dev postnow` → same as `!postnow`\n"
+            "`!dev reset_today` → same as `!reset_today`\n"
+            "`!dev setup` → show runtime config\n"
         )
+        return
 
-    @dev.command(name="setup", description="Show runtime config")
-    @admin_only()
-    async def dev_setup(interaction: discord.Interaction):
+    if action == "setup":
         ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
-        await send_ephemeral(
-            interaction,
+        await ctx.send(
             f"✅ Bot online.\n"
             f"- Daily channel ID: `{DAILY_CHANNEL_ID}` (name: `{getattr(ch, 'name', None)}`)\n"
             f"- Submit channel ID: `{SUBMIT_CHANNEL_ID}` (0 means any channel)\n"
@@ -1246,35 +1016,35 @@ if ENABLE_SLASH:
             f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
             f"- Windows mode: `{IS_WINDOWS}`\n"
             f"- GPP: `{GPP}`\n"
-            f"- ADMIN_ROLES: `{ADMIN_ROLES}`\n"
+            f"- ADMIN_ROLES: `{ADMIN_ROLES}`"
         )
+        return
 
-    @dev.command(name="list", description="List all families and kinds")
-    @admin_only()
-    async def dev_list(interaction: discord.Interaction):
+    if action == "postnow":
+        await postnow(ctx)
+        return
+
+    if action == "reset_today":
+        await reset_today(ctx)
+        return
+
+    if action == "list":
         msg = "**FAMILIES AND KINDS:**\n"
         total_count = 0
         for f, kinds in family_kinds.items():
             msg += f"- **{f}**: {', '.join(f'`{k}`' for k in kinds)}\n"
             total_count += len(kinds)
         msg += f"\n**Total:** {total_count}"
-        await send_ephemeral(interaction, msg)
+        await ctx.send(msg)
+        return
 
-    @dev.command(name="random", description="Pick a random problem (optionally choose a family)")
-    @admin_only()
-    @app_commands.describe(family="Optional family like arrays_basic")
-    async def dev_random(interaction: discord.Interaction, family: Optional[str] = None):
-        st = load_state()
-        date_str = today_str_ph()
-
+    if action == "random":
         if family is None:
             family = random.choice(list(family_kinds.keys()))
-        else:
-            family = family.lower().strip()
-            if family not in family_kinds:
-                families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
-                await send_ephemeral(interaction, f"❌ Invalid family '{family}'. Available:\n{families_list}")
-                return
+        elif family not in family_kinds:
+            families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
+            await ctx.send(f"❌ Invalid family '{family}'. Available families:\n{families_list}")
+            return
 
         kind = random.choice(family_kinds[family])
         day_index = 0
@@ -1301,40 +1071,38 @@ if ENABLE_SLASH:
             elif family == "stl_intro":
                 p = gen_stl_intro(rng, kind=kind)
             else:
-                await send_ephemeral(interaction, "❌ Unexpected error: family not recognized.")
+                await ctx.send("❌ Unexpected error: family not recognized.")
                 return
         except ValueError as e:
-            await send_ephemeral(interaction, f"❌ {e}")
+            await ctx.send(f"❌ {e}")
             return
 
         p["day"] = date_str
         p["seed"] = seed
         p["day_index"] = day_index
 
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["last_posted_date"] = date_str
-        st["day_index"] = day_index + 1
-        save_state(st)
+        pb = state.get("problems_by_date", {})
+        pb[date_str] = p
+        state["problems_by_date"] = pb
+        state["last_posted_date"] = date_str
+        state["day_index"] = day_index + 1
+        save_state(state)
 
-        await interaction.response.send_message(f"⚙️ **DEV PICK RANDOM:** {family} • {kind}", embed=build_embed(p))
+        await ctx.send(f"⚙️ **DEV PICK RANDOM:** {family} • {kind}", embed=build_embed(p))
+        return
 
-    @dev.command(name="pick", description="Pick a specific family+kind")
-    @admin_only()
-    @app_commands.describe(family="Family (e.g. arrays_basic)", kind="Kind (from /dev list)")
-    async def dev_pick(interaction: discord.Interaction, family: str, kind: str):
-        st = load_state()
-        date_str = today_str_ph()
-        family = family.lower().strip()
-        kind = kind.strip()
+    if action == "pick":
+        family = (family or "").lower().strip()
+        kind = (kind or "").strip()
 
-        if family not in family_kinds:
+        if not family or family not in family_kinds:
             families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
-            await send_ephemeral(interaction, f"❌ Invalid family. Available:\n{families_list}")
+            await ctx.send(f"❌ Invalid or missing family. Available families:\n{families_list}")
             return
 
-        if kind not in family_kinds[family]:
+        if not kind or kind not in family_kinds[family]:
             kinds_list = ", ".join(f"`{k}`" for k in family_kinds[family])
-            await send_ephemeral(interaction, f"❌ Invalid kind for `{family}`. Available:\n{kinds_list}")
+            await ctx.send(f"❌ Invalid or missing kind for family `{family}`. Available kinds:\n{kinds_list}")
             return
 
         day_index = 0
@@ -1361,505 +1129,103 @@ if ENABLE_SLASH:
             elif family == "stl_intro":
                 p = gen_stl_intro(rng, kind=kind)
             else:
-                await send_ephemeral(interaction, "❌ Unexpected error: family not recognized.")
+                await ctx.send("❌ Unexpected error: family not recognized.")
                 return
         except ValueError as e:
-            await send_ephemeral(interaction, f"❌ {e}")
+            await ctx.send(f"❌ {e}")
             return
 
         p["day"] = date_str
         p["seed"] = seed
         p["day_index"] = day_index
 
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["last_posted_date"] = date_str
-        st["day_index"] = day_index + 1
-        save_state(st)
+        pb = state.get("problems_by_date", {})
+        pb[date_str] = p
+        state["problems_by_date"] = pb
+        state["last_posted_date"] = date_str
+        state["day_index"] = day_index + 1
+        save_state(state)
 
-        await interaction.response.send_message(f"⚙️ **DEV PICK:** {family} • {kind}", embed=build_embed(p))
+        await ctx.send(f"⚙️ **DEV PICK:** {family} • {kind}", embed=build_embed(p))
+        return
 
-    tree.add_command(dev)
-
-# =========================
-# PREFIX COMMANDS
-# =========================
-if ENABLE_PREFIX:
-    @bot.command(name="help")
-    async def p_help(ctx: commands.Context):
-        await send_public(ctx, help_text())
-
-    @bot.command(name="ping")
-    async def p_ping(ctx: commands.Context):
-        await send_public(ctx, "pong")
-
-    @bot.command(name="today")
-    async def p_today(ctx: commands.Context):
-        st = load_state()
-        p = st.get("problems_by_date", {}).get(today_str_ph())
-        if not p:
-            await send_public(ctx, f"❌ No problem stored for today yet. Ask admin to `{COMMAND_PREFIX}postnow` or wait for schedule.")
-            return
-        await send_public(ctx, embed=build_embed(p))
-
-    @bot.command(name="rules")
-    async def p_rules(ctx: commands.Context):
-        await send_public(
-            ctx,
-            "**How to Submit (C++ only)**\n"
-            f"Use `{COMMAND_PREFIX}submit` and either:\n"
-            "1) Paste your full code after the command (you may include a ```cpp``` block), OR\n"
-            "2) Attach a `.cpp` file.\n\n"
-            "**No prompts** like `Enter n:` — output must match exactly."
-        )
-
-    @bot.command(name="format")
-    async def p_format(ctx: commands.Context):
-        await p_rules(ctx)
-
-    @bot.command(name="explain")
-    async def p_explain(ctx: commands.Context):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
-            return
-        fam = str(p.get("family", "")).lower()
-        if fam.startswith("arrays"):
-            msg = "🧠 **Arrays**: store input values in an array/vector and process using indexing like `a[i]`."
-        elif fam == "functions":
-            msg = "🧠 **Functions**: define at least one user-defined function (besides `main`) and call it from `main()`."
-        elif fam == "recursion":
-            msg = "🧠 **Recursion**: create a function that calls itself with a smaller input, with a clear base case."
-        elif fam == "strings":
-            msg = "🧠 **Strings**: use `string` / `getline` and handle spaces vs tokens carefully."
-        elif fam == "patterns":
-            msg = "🧠 **Patterns**: use loops to print line-by-line; outer loop = rows, inner loop = columns."
-        elif fam == "stl_intro":
-            msg = "🧠 **STL**: use `vector`, `sort`, `set`, `map`, etc. as required."
-        else:
-            msg = f"🧠 Topic: **{fam}**. Follow the input/output format and apply the required concept."
-        await send_public(ctx, msg)
-
-    @bot.command(name="approach")
-    async def p_approach(ctx: commands.Context):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
-            return
-        fam = str(p.get("family", "")).lower()
-        steps = ["1) Read input exactly as specified."]
-        if fam == "arrays_basic":
-            steps += ["2) Store the n values in `vector<long long> a(n)`.",
-                      "3) Loop through `a[i]` to compute the required result.",
-                      "4) Print the result only (no prompts)."]
-        elif fam == "arrays_nested":
-            steps += ["2) Store the data (often 2D / multiple values).",
-                      "3) Use nested loops (`for` inside `for`) to compute.",
-                      "4) Print result only."]
-        elif fam == "functions":
-            steps += ["2) Write a helper function that solves the core task.",
-                      "3) Call it from `main()` and print the return value."]
-        elif fam == "recursion":
-            steps += ["2) Identify base case.", "3) Write recursive step reducing the problem size.",
-                      "4) Call the recursive function and print the result."]
-        else:
-            steps += ["2) Use the required topic tools (see `!explain`).", "3) Match output format exactly."]
-        await send_public(ctx, "🧩 **Approach (today's problem)**\n" + "\n".join(steps))
-
-    @bot.command(name="hint")
-    async def p_hint(ctx: commands.Context):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
-            return
-        st = load_state()
-        ok, used = consume_hint(st, ctx.author.id, today_str_ph())
-        if not ok:
-            await send_public(ctx, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
-            return
-        save_state(st)
-        await send_public(ctx, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {tutor_hints(p)[0]}")
-
-    @bot.command(name="hint2")
-    async def p_hint2(ctx: commands.Context):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
-            return
-        st = load_state()
-        ok, used = consume_hint(st, ctx.author.id, today_str_ph())
-        if not ok:
-            await send_public(ctx, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
-            return
-        save_state(st)
-        hints = tutor_hints(p)
-        await send_public(ctx, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {hints[1] if len(hints) > 1 else hints[0]}")
-
-    @bot.command(name="hint3")
-    async def p_hint3(ctx: commands.Context):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
-            return
-        st = load_state()
-        ok, used = consume_hint(st, ctx.author.id, today_str_ph())
-        if not ok:
-            await send_public(ctx, f"❌ Hint limit reached for today ({HINTS_PER_DAY_LIMIT}).")
-            return
-        save_state(st)
-        hints = tutor_hints(p)
-        msg = hints[2] if len(hints) > 2 else hints[-1]
-        if TUTOR_FULL_CODE:
-            msg += "\n\n✅ *(Tutor mode)* `TUTOR_FULL_CODE=true` is enabled."
-        await send_public(ctx, f"💡 ({used}/{HINTS_PER_DAY_LIMIT}) {msg}")
-
-    @bot.command(name="dryrun")
-    async def p_dryrun(ctx: commands.Context):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
-            return
-        await send_public(
-            ctx,
-            "🧪 **Sample Dry Run**\n"
-            f"**Sample Input**\n```text\n{p.get('sample_in','')}```"
-            f"**Sample Output**\n```text\n{p.get('sample_out','')}```"
-        )
-
-    @bot.command(name="constraints")
-    async def p_constraints(ctx: commands.Context):
-        p = get_today_problem_from_state()
-        if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
-            return
-        await send_public(ctx, f"📌 **Constraints**\n{p.get('constraints','-')}")
-
-    @bot.command(name="leaderboard")
-    async def p_leaderboard(ctx: commands.Context):
-        st = load_state()
-        rows = list(st.get("scores", {}).values())
-        if not rows:
-            await send_public(ctx, "No leaderboard data yet.")
-            return
-        rows.sort(key=lambda r: (int(r.get("weekly_accepts", 0)), int(r.get("accepted", 0))), reverse=True)
-        lines = ["🏆 **Weekly Leaderboard**"]
-        for i, r in enumerate(rows[:10], start=1):
-            lines.append(f"{i}. **{r.get('name','user')}** — weekly `{r.get('weekly_accepts',0)}` | total `{r.get('accepted',0)}` | streak `{r.get('streak',0)}`")
-        await send_public(ctx, "\n".join(lines))
-
-    @bot.command(name="submit")
-    async def p_submit(ctx: commands.Context, *, payload: str = ""):
-        # code can be in payload or an attachment
-        attachment = ctx.message.attachments[0] if ctx.message.attachments else None
-
-        async def progress(msg: str):
-            await send_public(ctx, msg)
-
-        async def result(msg: str):
-            await send_public(ctx, msg)
-
-        await progress("✅ Submission received. Starting judge...")
-        await judge_submission(
-            user_id=ctx.author.id,
-            user_display=str(ctx.author),
-            channel_id=ctx.channel.id,
-            code_text=payload.strip() if payload.strip() else None,
-            attachment=attachment,
-            progress_cb=progress,
-            result_cb=result,
-        )
-
-    # ---- PREFIX: ADMIN ----
-    def prefix_admin_only():
-        async def predicate(ctx: commands.Context) -> bool:
-            if not ctx.guild or not isinstance(ctx.author, discord.Member):
-                return False
-            return is_admin_member(ctx.author)
-        return commands.check(predicate)
-
-    @bot.command(name="status")
-    @prefix_admin_only()
-    async def p_status(ctx: commands.Context):
-        st = load_state()
-        date_str = today_str_ph()
-        stored = date_str in st.get("problems_by_date", {})
-        di = int(st.get("day_index", 0))
-        up = int(time.monotonic() - BOT_START_MONO)
-        nxt = next_post_time_ph()
-        await send_public(
-            ctx,
-            "**Bot Status**\n"
-            f"- Uptime: `{up}s`\n"
-            f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` | ENABLE_SLASH: `{ENABLE_SLASH}`\n"
-            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
-            f"- Day index: `{di}`\n"
-            f"- Today stored: `{stored}` ({date_str})\n"
-            f"- Next scheduled post (PH): `{nxt.isoformat()}`\n"
-            f"- Queue busy: `{SUBMIT_LOCK.locked()}`\n"
-            f"- DAILY_CHANNEL_ID: `{DAILY_CHANNEL_ID}`\n"
-            f"- SUBMIT_CHANNEL_ID: `{SUBMIT_CHANNEL_ID}`\n"
-            f"- GPP: `{GPP}` exists=`{bool(shutil.which(GPP) or os.path.exists(GPP))}`\n"
-            f"- Metrics: `{JUDGE_METRICS}`\n"
-            f"- Build: `{BOT_UPDATES_VERSION}`\n"
-        )
-
-    @bot.command(name="postnow")
-    @prefix_admin_only()
-    async def p_postnow(ctx: commands.Context):
-        ch = bot.get_channel(DAILY_CHANNEL_ID)
-        if ch is None or not isinstance(ch, discord.abc.Messageable):
-            await send_public(ctx, "❌ Daily channel not found. Check DAILY_CHANNEL_ID.")
+    if action == "submit":
+        # Admin testing: judge code provided in the same message.
+        if ctx.channel.id != DAILY_CHANNEL_ID:
+            await ctx.send(f"❌ `!dev submit` only works in <#{DAILY_CHANNEL_ID}>.")
             return
 
-        st = load_state()
-        date_str = today_str_ph()
-        existing = st.get("problems_by_date", {}).get(date_str)
-        if existing:
-            await ch.send("⚙️ **DAILY MP DROP (repost):**", embed=build_embed(existing))
-            await send_public(ctx, "✅ Reposted the already-stored problem for today.")
+        msg: discord.Message = ctx.message
+        code = await read_attachment_code(msg) or extract_cpp_from_message(msg.content)
+
+        if not code:
+            await ctx.send("❌ No C++ code found in message or attachment.")
             return
 
-        di = int(st.get("day_index", 0))
-        p = generate_problem(di, date_str)
-        await ch.send("⚙️ **DAILY MP DROP (manual):** Solve it in C++ and submit.", embed=build_embed(p))
-
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["day_index"] = di + 1
-        st["last_posted_date"] = date_str
-        save_state(st)
-
-        await send_public(ctx, f"✅ Posted today’s problem to <#{DAILY_CHANNEL_ID}> (day_index was {di}).")
-
-    @bot.command(name="reset_today")
-    @prefix_admin_only()
-    async def p_reset_today(ctx: commands.Context):
-        st = load_state()
-        date_str = today_str_ph()
-        pb = st.get("problems_by_date", {})
-        if date_str not in pb:
-            await send_public(ctx, "✅ Nothing to reset for today (no stored problem).")
+        problem = state.get("problems_by_date", {}).get(date_str)
+        if not problem:
+            await ctx.send("❌ No active problem for today. Pick one first with `!dev pick`.")
             return
-        pb.pop(date_str, None)
-        st["problems_by_date"] = pb
-        st["last_posted_date"] = None
-        save_state(st)
-        await send_public(ctx, f"✅ Reset done. Use `{COMMAND_PREFIX}postnow` to post a new problem for today.")
 
-    @bot.command(name="regen_today")
-    @prefix_admin_only()
-    async def p_regen_today(ctx: commands.Context):
-        st = load_state()
-        date_str = today_str_ph()
-        di = int(st.get("day_index", 0))
-        p = generate_problem(di, date_str)
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["day_index"] = di + 1
-        st["last_posted_date"] = date_str
-        append_audit(st, {"action": "regen_today", "by": str(ctx.author), "day_index": di, "seed": p.get("seed")})
-        save_state(st)
-
-        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
-        if ch and isinstance(ch, discord.abc.Messageable):
-            await ch.send("⚙️ **DAILY MP DROP (regenerated):**", embed=build_embed(p))
-
-        await send_public(ctx, f"✅ Regenerated today's problem (seed={p.get('seed')}).")
-
-    @bot.command(name="repost_date")
-    @prefix_admin_only()
-    async def p_repost_date(ctx: commands.Context, date: str):
-        st = load_state()
-        p = st.get("problems_by_date", {}).get(date)
-        if not p:
-            await send_public(ctx, "❌ No stored problem for that date.")
-            return
-        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
-        if ch is None or not isinstance(ch, discord.abc.Messageable):
-            await send_public(ctx, "❌ Daily channel not found.")
-            return
-        await ch.send(f"⚙️ **DAILY MP DROP (backfill {date}):**", embed=build_embed(p))
-        append_audit(st, {"action": "repost_date", "by": str(ctx.author), "date": date})
-        save_state(st)
-        await send_public(ctx, "✅ Reposted.")
-
-    @bot.group(name="dev", invoke_without_command=True)
-    @prefix_admin_only()
-    async def p_dev(ctx: commands.Context):
-        await send_public(ctx, f"Use `{COMMAND_PREFIX}dev help`")
-
-    @p_dev.command(name="help")
-    async def p_dev_help(ctx: commands.Context):
-        await send_public(
-            ctx,
-            "**DEV COMMANDS:**\n"
-            f"`{COMMAND_PREFIX}dev list` → list all families/kinds\n"
-            f"`{COMMAND_PREFIX}dev random [family]` → pick random problem\n"
-            f"`{COMMAND_PREFIX}dev pick <family> <kind>` → pick specific problem\n"
-            f"`{COMMAND_PREFIX}dev setup` → show runtime config\n"
-        )
-
-    @p_dev.command(name="setup")
-    async def p_dev_setup(ctx: commands.Context):
-        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
-        await send_public(
-            ctx,
-            f"✅ Bot online.\n"
-            f"- Daily channel ID: `{DAILY_CHANNEL_ID}` (name: `{getattr(ch, 'name', None)}`)\n"
-            f"- Submit channel ID: `{SUBMIT_CHANNEL_ID}` (0 means any channel)\n"
-            f"- Post time: `{POST_TIME}` (PH time)\n"
-            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
-            f"- Windows mode: `{IS_WINDOWS}`\n"
-            f"- GPP: `{GPP}`\n"
-            f"- ADMIN_ROLES: `{ADMIN_ROLES}`\n"
-        )
-
-    @p_dev.command(name="list")
-    async def p_dev_list(ctx: commands.Context):
-        msg = "**FAMILIES AND KINDS:**\n"
-        total_count = 0
-        for f, kinds in family_kinds.items():
-            msg += f"- **{f}**: {', '.join(f'`{k}`' for k in kinds)}\n"
-            total_count += len(kinds)
-        msg += f"\n**Total:** {total_count}"
-        await send_public(ctx, msg)
-
-    @p_dev.command(name="random")
-    async def p_dev_random(ctx: commands.Context, family: Optional[str] = None):
-        st = load_state()
-        date_str = today_str_ph()
-
-        if family is None:
-            family = random.choice(list(family_kinds.keys()))
-        else:
-            family = family.lower().strip()
-            if family not in family_kinds:
-                families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
-                await send_public(ctx, f"❌ Invalid family '{family}'. Available:\n{families_list}")
+        if ENFORCE_SKILLS:
+            ok_skill, skill_msg = enforce_skill(problem, code)
+            if not ok_skill:
+                await ctx.send("[DEV] " + skill_msg)
                 return
 
-        kind = random.choice(family_kinds[family])
-        day_index = 0
-        seed = stable_seed_for_day(day_index, date_str)
-        rng = random.Random(seed)
+        async with SUBMIT_LOCK:
+            status_msg = await ctx.send("🧪 [DEV] Compiling...")
 
-        try:
-            if family == "arrays_basic":
-                p = gen_arrays_basic(rng, kind=kind)
-            elif family == "arrays_nested":
-                p = gen_arrays_nested(rng, kind=kind)
-            elif family == "bool_checks":
-                p = gen_bool_checks(rng, kind=kind)
-            elif family == "functions":
-                p = gen_functions(rng, kind=kind)
-            elif family == "patterns":
-                p = gen_patterns(rng, kind=kind)
-            elif family == "strings":
-                p = gen_strings(rng, kind=kind)
-            elif family == "math_logic":
-                p = gen_math_logic(rng, kind=kind)
-            elif family == "recursion":
-                p = gen_recursion(rng, kind=kind)
-            elif family == "stl_intro":
-                p = gen_stl_intro(rng, kind=kind)
-            else:
-                await send_public(ctx, "❌ Unexpected error: family not recognized.")
-                return
-        except ValueError as e:
-            await send_public(ctx, f"❌ {e}")
-            return
+            with tempfile.TemporaryDirectory(prefix="cs1judge_") as workdir:
+                ok, cerr = await compile_cpp(code, workdir)
+                if not ok:
+                    cerr = cerr.strip()
+                    if len(cerr) > 1800:
+                        cerr = cerr[:1800] + "\n... (truncated)"
+                    await status_msg.edit(content="❌ Compilation Error")
+                    await ctx.send(f"```text\n{cerr}\n```")
+                    return
 
-        p["day"] = date_str
-        p["seed"] = seed
-        p["day_index"] = day_index
+                await status_msg.edit(content=f"✅ Compiled. Running tests (0/{len(problem.get('tests',[]))})...")
 
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["last_posted_date"] = date_str
-        st["day_index"] = day_index + 1
-        save_state(st)
+                for i, t in enumerate(problem.get("tests", []), start=1):
+                    await status_msg.edit(content=f"🏃 Running tests ({i}/{len(problem.get('tests',[]))})...")
+                    passed, verdict, details = await run_one_test(workdir, t)
+                    if not passed:
+                        await status_msg.edit(content=f"❌ {verdict} — failed test #{i}")
+                        tinp = details["test"]["inp"] if details and "test" in details else ""
+                        if verdict == "Wrong Answer" and details:
+                            exp = details["expected"]
+                            got = details["got"]
+                            line_no, e_line, g_line = first_mismatch_line(exp, got)
+                            out_msg = (
+                                f"**Input**\n```text\n{clamp_block(tinp, 900)}```"
+                                f"**Expected**\n```text\n{clamp_block(exp, 900)}```"
+                                f"**Got**\n```text\n{clamp_block(got, 900)}```"
+                            )
+                            if line_no:
+                                out_msg += f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
+                            await ctx.send(out_msg)
+                        else:
+                            if tinp:
+                                await ctx.send(f"**Input**\n```text\n{clamp_block(tinp, 1200)}```")
+                        return
 
-        await send_public(ctx, f"⚙️ **DEV PICK RANDOM:** {family} • {kind}", embed=build_embed(p))
+                await status_msg.edit(content="✅ [DEV] Accepted — all tests passed.")
+                await ctx.send(f"[DEV] Problem: **{problem['title']}** (Day {problem['day']})")
+        return
 
-    @p_dev.command(name="pick")
-    async def p_dev_pick(ctx: commands.Context, family: str, kind: str):
-        st = load_state()
-        date_str = today_str_ph()
-        family = family.lower().strip()
-        kind = kind.strip()
-
-        if family not in family_kinds:
-            families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
-            await send_public(ctx, f"❌ Invalid family. Available:\n{families_list}")
-            return
-
-        if kind not in family_kinds[family]:
-            kinds_list = ", ".join(f"`{k}`" for k in family_kinds[family])
-            await send_public(ctx, f"❌ Invalid kind for `{family}`. Available:\n{kinds_list}")
-            return
-
-        day_index = 0
-        seed = stable_seed_for_day(day_index, date_str)
-        rng = random.Random(seed)
-
-        try:
-            if family == "arrays_basic":
-                p = gen_arrays_basic(rng, kind=kind)
-            elif family == "arrays_nested":
-                p = gen_arrays_nested(rng, kind=kind)
-            elif family == "bool_checks":
-                p = gen_bool_checks(rng, kind=kind)
-            elif family == "functions":
-                p = gen_functions(rng, kind=kind)
-            elif family == "patterns":
-                p = gen_patterns(rng, kind=kind)
-            elif family == "strings":
-                p = gen_strings(rng, kind=kind)
-            elif family == "math_logic":
-                p = gen_math_logic(rng, kind=kind)
-            elif family == "recursion":
-                p = gen_recursion(rng, kind=kind)
-            elif family == "stl_intro":
-                p = gen_stl_intro(rng, kind=kind)
-            else:
-                await send_public(ctx, "❌ Unexpected error: family not recognized.")
-                return
-        except ValueError as e:
-            await send_public(ctx, f"❌ {e}")
-            return
-
-        p["day"] = date_str
-        p["seed"] = seed
-        p["day_index"] = day_index
-
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["last_posted_date"] = date_str
-        st["day_index"] = day_index + 1
-        save_state(st)
-
-        await send_public(ctx, f"⚙️ **DEV PICK:** {family} • {kind}", embed=build_embed(p))
+    await ctx.send("❌ Invalid `!dev` action. Use `help`, `list`, `random`, `pick`, `submit`, `postnow`, `reset_today`, `setup`.")
 
 # =========================
-# READY: SYNC + START TASKS
+# STARTUP CHECKS
 # =========================
-@bot.event
-async def on_ready():
-    logging.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
-    logging.info("Config: DAILY_CHANNEL_ID=%s SUBMIT_CHANNEL_ID=%s ENABLE_PREFIX=%s ENABLE_SLASH=%s ENFORCE_SKILLS=%s ADMIN_ROLES=%s",
-                 DAILY_CHANNEL_ID, SUBMIT_CHANNEL_ID, ENABLE_PREFIX, ENABLE_SLASH, ENFORCE_SKILLS, ADMIN_ROLES)
-    logging.info("Config: COMPILE_TIMEOUT=%ss RUN_TIMEOUT=%ss MAX_CODE_BYTES=%s COOLDOWN=%ss",
-                 COMPILE_TIMEOUT_SEC, RUN_TIMEOUT_SEC, MAX_CODE_BYTES, SUBMIT_COOLDOWN_SEC)
+def _die(msg: str) -> None:
+    raise RuntimeError(msg)
 
-    # ✅ IMPORTANT FIX: don't clear slash commands.
-    if ENABLE_SLASH:
-        try:
-            await bot.tree.sync()
-            logging.info("Synced slash commands.")
-        except Exception as e:
-            logging.exception("Slash sync failed: %s", e)
+if not TOKEN:
+    _die("DISCORD_TOKEN env var missing. Set DISCORD_TOKEN before running.")
+if DAILY_CHANNEL_ID == 0:
+    _die("DAILY_CHANNEL_ID env var missing. Set DAILY_CHANNEL_ID before running.")
 
-    if not post_daily_problem.is_running():
-        post_daily_problem.start()
-
-# =========================
-# MAIN
-# =========================
-if __name__ == "__main__":
-    validate_config()
-    bot.run(TOKEN)
+bot.run(TOKEN)
