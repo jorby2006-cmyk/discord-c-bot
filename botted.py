@@ -118,7 +118,11 @@ intents = discord.Intents.default()
 # Prefix commands need message_content to see messages
 intents.message_content = True
 
-bot = commands.Bot(command_prefix=(COMMAND_PREFIX if ENABLE_PREFIX else None), intents=intents)
+bot = commands.Bot(
+    command_prefix=(COMMAND_PREFIX if ENABLE_PREFIX else None),
+    intents=intents,
+    help_command=None,
+)
 
 def is_admin_member(member: discord.Member) -> bool:
     try:
