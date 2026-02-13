@@ -1,7 +1,6 @@
 # botted.py — CS1 Daily MP + C++ Judge (Slash Commands Edition)
 #
-# ✅ Full rewrite: prefix commands → SLASH commands (/submit, /today, /help, etc.)
-# ✅ Autocomplete in Discord UI like your screenshot
+# ✅ Prefix commands enabled via ! (e.g. !submit)
 # ✅ Keeps: daily MP posting, judging, cooldowns, hints, leaderboard, admin/dev tools
 #
 # Requirements:
@@ -125,12 +124,14 @@ SKILL_HARD_FAIL_CONFIDENCE = float(os.getenv("SKILL_HARD_FAIL_CONFIDENCE", "0.75
 SKILL_WARN_CONFIDENCE = float(os.getenv("SKILL_WARN_CONFIDENCE", "0.45"))
 HINTS_PER_DAY_LIMIT = int(os.getenv("HINTS_PER_DAY_LIMIT", "5"))
 
-BOT_UPDATES_VERSION = "2026-02-slash-rewrite"
+BOT_UPDATES_VERSION = "2026-02-prefix-bang"
+COMMAND_PREFIX = "!"
 
 # =========================
 # DISCORD BOT SETUP
 # =========================
 intents = discord.Intents.default()
+intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -348,7 +349,7 @@ def build_embed(problem: dict) -> discord.Embed:
 
     embed.add_field(
         name="How to Submit (C++ only)",
-        value="Use `/submit` and paste your full C++ code (or attach a .cpp file). "
+        value="Use `!submit` and paste your full C++ code (or attach a .cpp file). "
               "No prompts like `Enter n:` — output must match exactly.",
         inline=False,
     )
@@ -393,6 +394,11 @@ async def get_code_from_slash_inputs(code_text: Optional[str], attachment: Optio
         suffix = "..." if len(candidates) > 4 else ""
         return None, f"{ERR_AMBIGUOUS_CODE}: Found multiple code payloads ({names}{suffix}). Submit exactly one payload."
     return candidates[0][1], None
+
+async def get_code_from_message(message: discord.Message, raw_text: str) -> Tuple[Optional[str], Optional[str]]:
+    code_text = raw_text.strip() if raw_text else None
+    attachment = message.attachments[0] if message.attachments else None
+    return await get_code_from_slash_inputs(code_text, attachment)
 
 def exe_path(workdir: str) -> str:
     return os.path.join(workdir, "main.exe" if IS_WINDOWS else "main.out")
@@ -726,7 +732,7 @@ async def post_daily_problem():
     day_index = int(state.get("day_index", 0))
     problem = generate_problem(day_index, date_str)
 
-    await channel.send("⚙️ **DAILY MP DROP:** Solve it in C++ and submit with `/submit`.", embed=build_embed(problem))
+    await channel.send("⚙️ **DAILY MP DROP:** Solve it in C++ and submit with `!submit`.", embed=build_embed(problem))
 
     pb = state.get("problems_by_date", {})
     pb[date_str] = problem
@@ -766,30 +772,30 @@ def validate_config() -> None:
 HELP_TEXT = (
     "**📌 CS1 Daily MP Bot — Commands**\n\n"
     "**Student**\n"
-    "• `/help` — show this menu\n"
-    "• `/ping` — bot check\n"
-    "• `/today` — show today’s problem\n"
-    "• `/submit` — submit your C++ solution\n"
-    "• `/rules` — submission format\n"
-    "• `/format` — same as rules\n"
-    "• `/explain` — topic explanation\n"
-    "• `/approach` — steps for today’s MP\n"
-    "• `/hint`, `/hint2`, `/hint3` — progressive hints (daily limit)\n"
-    "• `/dryrun` — show sample I/O\n"
-    "• `/constraints` — show constraints\n"
-    "• `/leaderboard` — weekly leaderboard\n\n"
+    "• `!help` — show this menu\n"
+    "• `!ping` — bot check\n"
+    "• `!today` — show today’s problem\n"
+    "• `!submit` — submit your C++ solution\n"
+    "• `!rules` — submission format\n"
+    "• `!format` — same as rules\n"
+    "• `!explain` — topic explanation\n"
+    "• `!approach` — steps for today’s MP\n"
+    "• `!hint`, `!hint2`, `!hint3` — progressive hints (daily limit)\n"
+    "• `!dryrun` — show sample I/O\n"
+    "• `!constraints` — show constraints\n"
+    "• `!leaderboard` — weekly leaderboard\n\n"
     "**Admin**\n"
-    "• `/status` — bot status + metrics\n"
-    "• `/postnow` — post today’s MP now\n"
-    "• `/reset_today` — reset today’s MP\n"
-    "• `/regen_today` — regenerate today’s MP\n"
-    "• `/repost_date YYYY-MM-DD` — repost stored MP\n\n"
+    "• `!status` — bot status + metrics\n"
+    "• `!postnow` — post today’s MP now\n"
+    "• `!reset_today` — reset today’s MP\n"
+    "• `!regen_today` — regenerate today’s MP\n"
+    "• `!repost_date YYYY-MM-DD` — repost stored MP\n\n"
     "**Dev (Admin only)**\n"
-    "• `/dev help`\n"
-    "• `/dev list`\n"
-    "• `/dev random [family]`\n"
-    "• `/dev pick <family> <kind>`\n"
-    "• `/dev setup`\n"
+    "• `!dev help`\n"
+    "• `!dev list`\n"
+    "• `!dev random [family]`\n"
+    "• `!dev pick <family> <kind>`\n"
+    "• `!dev setup`\n"
 )
 
 # =========================
@@ -817,7 +823,7 @@ async def today(interaction: discord.Interaction):
 async def rules(interaction: discord.Interaction):
     await interaction.response.send_message(
         "**How to Submit (C++ only)**\n"
-        "Use `/submit` and either:\n"
+        "Use `!submit` and either:\n"
         "1) Paste your full code in the `code` field (you may include a ```cpp``` block), OR\n"
         "2) Attach a `.cpp` file.\n\n"
         "**No prompts** like `Enter n:` — output must match exactly.",
@@ -1155,7 +1161,7 @@ async def postnow(interaction: discord.Interaction):
     di = int(st.get("day_index", 0))
     p = generate_problem(di, date_str)
 
-    await ch.send("⚙️ **DAILY MP DROP (manual):** Solve it in C++ and submit with `/submit`.", embed=build_embed(p))
+    await ch.send("⚙️ **DAILY MP DROP (manual):** Solve it in C++ and submit with `!submit`.", embed=build_embed(p))
 
     pb = st.get("problems_by_date", {})
     pb[date_str] = p
@@ -1384,6 +1390,147 @@ async def dev_pick(interaction: discord.Interaction, family: str, kind: str):
 
 tree.add_command(dev)
 
+
+
+async def handle_prefix_submit(message: discord.Message, raw_payload: str) -> None:
+    if SUBMIT_LOCK.locked():
+        await message.channel.send("⏳ Another submission is being judged right now. Please wait a moment.")
+        return
+
+    async with SUBMIT_LOCK:
+        if SUBMIT_CHANNEL_ID and message.channel and message.channel.id != SUBMIT_CHANNEL_ID:
+            if SUBMIT_CHANNEL_ID != DAILY_CHANNEL_ID:
+                await message.channel.send(f"❌ Submit only in <#{SUBMIT_CHANNEL_ID}>.")
+                return
+
+        st = load_state()
+        uid = message.author.id
+        rem = cooldown_remaining_sec(st, uid)
+        if rem > 0:
+            await message.channel.send(f"⏳ Cooldown: wait `{rem}s` before submitting again.")
+            return
+
+        date_str = today_str_ph()
+        problem = st.get("problems_by_date", {}).get(date_str)
+        if not problem:
+            await message.channel.send("❌ No active problem for today. Ask admin to `!postnow`.")
+            return
+
+        src, parse_err = await get_code_from_message(message, raw_payload)
+        if parse_err:
+            await message.channel.send(f"❌ {parse_err}")
+            return
+        if not src:
+            await message.channel.send(f"❌ {ERR_NO_CODE}: No code payload found.")
+            return
+
+        if len(src.encode("utf-8", errors="ignore")) > MAX_CODE_BYTES:
+            await message.channel.send(f"❌ {ERR_CODE_TOO_LARGE}: Code too large. Limit is {MAX_CODE_BYTES} bytes.")
+            return
+
+        if ENFORCE_SKILLS:
+            ok_skill, skill_msg, confidence = enforce_skill(problem, src)
+            if not ok_skill and confidence >= SKILL_HARD_FAIL_CONFIDENCE:
+                await message.channel.send(skill_msg + f"\n(Confidence: {confidence:.2f}. Teacher: set `ENFORCE_SKILLS=false` to disable.)")
+                return
+            if not ok_skill and confidence >= SKILL_WARN_CONFIDENCE:
+                await message.channel.send(f"⚠️ Skill-check warning (confidence {confidence:.2f}): {skill_msg}")
+
+        tests = problem.get("tests", [])
+        await message.channel.send("🧪 Compiling...")
+        JUDGE_METRICS["submissions"] += 1
+
+        with tempfile.TemporaryDirectory(prefix="cs1judge_") as workdir:
+            ok, cerr = await compile_cpp(src, workdir)
+            if not ok:
+                cerr = cerr.strip()
+                record_compile_error(st, uid, cerr)
+                JUDGE_METRICS["compile_errors"] += 1
+                set_cooldown(st, uid, COOLDOWN_AFTER_FAIL_SEC)
+                score_submission(st, uid, str(message.author), accepted=False, date_str=date_str)
+                save_state(st)
+                short = cerr[:1800] + ("\n... (truncated)" if len(cerr) > 1800 else "")
+                await message.channel.send(f"❌ {ERR_COMPILE_FAIL}: Compilation Error\n```text\n{short}\n```")
+                return
+
+            await message.channel.send(f"✅ Compiled. Running tests (0/{len(tests)})...")
+            for i, t in enumerate(tests, start=1):
+                passed, verdict, details = await run_one_test(workdir, t)
+                if not passed:
+                    kind = (details or {}).get("kind")
+                    if kind == "wa":
+                        JUDGE_METRICS["wrong_answers"] += 1
+                    elif kind == "runtime":
+                        JUDGE_METRICS["runtime_errors"] += 1
+                    elif kind == "timeout":
+                        JUDGE_METRICS["timeouts"] += 1
+                    elif kind == "output_limit":
+                        JUDGE_METRICS["output_limit_exceeded"] += 1
+
+                    set_cooldown(st, uid, COOLDOWN_AFTER_FAIL_SEC)
+                    score_submission(st, uid, str(message.author), accepted=False, date_str=date_str)
+                    save_state(st)
+
+                    await message.channel.send(f"❌ {verdict} — failed test #{i}")
+                    tinp = details["test"]["inp"] if details and "test" in details else ""
+                    if details and details.get("kind") == "wa":
+                        exp = details["expected"]
+                        got = details["got"]
+                        line_no, e_line, g_line = first_mismatch_line(exp, got)
+                        msg_out = (
+                            f"**Input**\n```text\n{clamp_block(tinp, 900)}```"
+                            f"**Expected**\n```text\n{clamp_block(exp, 900)}```"
+                            f"**Got**\n```text\n{clamp_block(got, 900)}```"
+                        )
+                        if line_no:
+                            msg_out += f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
+                        await message.channel.send(msg_out)
+                    elif tinp:
+                        await message.channel.send(f"**Input**\n```text\n{clamp_block(tinp, 1200)}```")
+                    return
+
+            JUDGE_METRICS["accepted"] += 1
+            set_cooldown(st, uid, COOLDOWN_AFTER_ACCEPT_SEC)
+            score_submission(st, uid, str(message.author), accepted=True, date_str=date_str)
+            save_state(st)
+            await message.channel.send(f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.\nProblem: **{problem['title']}** (Day {problem['day']})")
+
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    content = (message.content or "").strip()
+    if not content.startswith(COMMAND_PREFIX):
+        return
+
+    cmdline = content[len(COMMAND_PREFIX):].strip()
+    if not cmdline:
+        return
+    cmd, _, rest = cmdline.partition(" ")
+    cmd = cmd.lower()
+
+    if cmd == "help":
+        await message.channel.send(HELP_TEXT)
+    elif cmd == "ping":
+        await message.channel.send("pong")
+    elif cmd == "today":
+        st = load_state()
+        p = st.get("problems_by_date", {}).get(today_str_ph())
+        if not p:
+            await message.channel.send("❌ No problem stored for today yet. Ask admin to `!postnow` or wait for schedule.")
+            return
+        await message.channel.send(embed=build_embed(p))
+    elif cmd in {"rules", "format"}:
+        await message.channel.send(
+            "**How to Submit (C++ only)**\n"
+            "Use `!submit` and either:\n"
+            "1) Paste your full code after the command (you may include a ```cpp``` block), OR\n"
+            "2) Attach a `.cpp` file.\n\n"
+            "**No prompts** like `Enter n:` — output must match exactly."
+        )
+    elif cmd == "submit":
+        await handle_prefix_submit(message, rest)
+
 # =========================
 # EVENT: READY + COMMAND SYNC
 # =========================
@@ -1396,12 +1543,13 @@ async def on_ready():
     logging.info("Config: COMPILE_TIMEOUT=%ss RUN_TIMEOUT=%ss MAX_CODE_BYTES=%s COOLDOWN=%ss",
                  COMPILE_TIMEOUT_SEC, RUN_TIMEOUT_SEC, MAX_CODE_BYTES, SUBMIT_COOLDOWN_SEC)
 
-    # Sync slash commands (global). First sync can take a bit to appear in Discord.
+    # Prefix-only mode: clear slash commands so only !commands are recognized.
     try:
+        tree.clear_commands(guild=None)
         await tree.sync()
-        logging.info("Slash commands synced.")
+        logging.info("Cleared slash commands; prefix-only mode enabled.")
     except Exception as e:
-        logging.exception("Failed to sync commands: %s", e)
+        logging.exception("Failed to clear slash commands: %s", e)
 
     if not post_daily_problem.is_running():
         post_daily_problem.start()
