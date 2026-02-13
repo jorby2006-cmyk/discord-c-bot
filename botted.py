@@ -48,10 +48,13 @@ DAILY_CHANNEL_ID = int(os.getenv("DAILY_CHANNEL_ID", "0"))  # required
 SUBMIT_CHANNEL_ID = int(os.getenv("SUBMIT_CHANNEL_ID", "0"))  # optional; 0 = any channel
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-# PREFIX ONLY (no slash)
-ENABLE_SLASH = False
+# PREFIX ONLY (NO SLASH)
 ENABLE_PREFIX = os.getenv("ENABLE_PREFIX", "true").strip().lower() in ("1", "true", "yes", "y", "on")
-COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "c").strip() or "c"  # default 'c'
+
+# You said: commands must be like "c help"
+PREFIX_BASE = "c"
+PREFIX = "c "          # REQUIRED SPACE
+PREFIX_CAP = "C "      # allow capital too
 
 # Philippines time (UTC+8). Daily post is at 09:00 AM PH time.
 PH_TZ = datetime.timezone(datetime.timedelta(hours=8))
@@ -73,9 +76,7 @@ COOLDOWN_AFTER_FAIL_SEC = int(os.getenv("COOLDOWN_AFTER_FAIL_SEC", str(SUBMIT_CO
 ENFORCE_SKILLS = os.getenv("ENFORCE_SKILLS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 TUTOR_FULL_CODE = os.getenv("TUTOR_FULL_CODE", "false").strip().lower() in ("1", "true", "yes", "y", "on")
 
-# If you want "strict arrays" (require actual array/vector declaration) set true.
 STRICT_ARRAYS = os.getenv("STRICT_ARRAYS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
-# If you want "strict functions" (require helper besides main, not lambda) set true.
 STRICT_FUNCTIONS = os.getenv("STRICT_FUNCTIONS", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 
 # ---- Anti-plagiarism (token fingerprint) ----
@@ -84,11 +85,7 @@ PLAGIARISM_THRESHOLD = float(os.getenv("PLAGIARISM_THRESHOLD", "0.88"))
 PLAGIARISM_MIN_TOKENS = int(os.getenv("PLAGIARISM_MIN_TOKENS", "80"))
 PLAGIARISM_HARD_FAIL = os.getenv("PLAGIARISM_HARD_FAIL", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 PLAGIARISM_COMPARE_ACCEPTED_ONLY = os.getenv("PLAGIARISM_COMPARE_ACCEPTED_ONLY", "true").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
+    "1", "true", "yes", "y", "on"
 )
 
 ADMIN_ROLES = [r.strip() for r in os.getenv("ADMIN_ROLES", "Root Admin").split(",") if r.strip()]
@@ -126,7 +123,7 @@ SKILL_HARD_FAIL_CONFIDENCE = float(os.getenv("SKILL_HARD_FAIL_CONFIDENCE", "0.90
 SKILL_WARN_CONFIDENCE = float(os.getenv("SKILL_WARN_CONFIDENCE", "0.60"))
 HINTS_PER_DAY_LIMIT = int(os.getenv("HINTS_PER_DAY_LIMIT", "5"))
 
-BOT_UPDATES_VERSION = "2026-02-prefix-only-c-supports-c-and-cspace"
+BOT_UPDATES_VERSION = "2026-02-prefix-c-space-only"
 
 # =========================
 # DISCORD BOT SETUP
@@ -137,20 +134,16 @@ intents.message_content = True  # Prefix commands need message_content to see me
 
 def _prefix_callable(_bot: commands.Bot, _message: discord.Message):
     """
-    Supports:
-      - "csubmit" (no space)
-      - "c submit" (with space)
-      - mention prefix
+    ONLY supports:
+      - "c help" (WITH SPACE)
+      - "C help"
+      - bot mention prefix
+    Does NOT support:
+      - "chelp"
     """
     if not ENABLE_PREFIX:
         return "NO_PREFIX__"
-
-    base = (COMMAND_PREFIX or "c").strip()
-    prefixes = [base]
-    if not base.endswith(" "):
-        prefixes.append(base + " ")  # allow "c help"
-    # Also allow bot mentions as prefix
-    return commands.when_mentioned_or(*prefixes)(_bot, _message)
+    return commands.when_mentioned_or(PREFIX, PREFIX_CAP)(_bot, _message)
 
 
 bot = commands.Bot(
@@ -442,7 +435,6 @@ def build_embed(problem: dict) -> discord.Embed:
     )
     if problem.get("note"):
         desc += f"\n**Note**\n{problem['note']}\n"
-
     if problem.get("kind"):
         desc += f"\n**Kind**\n`{problem['kind']}`\n"
 
@@ -455,12 +447,11 @@ def build_embed(problem: dict) -> discord.Embed:
     embed.add_field(name="Sample Input", value=f"```text\n{problem['sample_in']}```", inline=False)
     embed.add_field(name="Sample Output", value=f"```text\n{problem['sample_out']}```", inline=False)
 
-    how = []
-    if ENABLE_PREFIX:
-        how.append(f"Use `{COMMAND_PREFIX}submit` (or `{COMMAND_PREFIX} submit`) and paste your full C++ code (or attach a .cpp file).")
-    how.append("No prompts like `Enter n:` — output must match exactly.")
+    how = [
+        f"Use `{PREFIX}submit` (example: `{PREFIX}submit <paste code>` or attach a .cpp file).",
+        "No prompts like `Enter n:` — output must match exactly.",
+    ]
     embed.add_field(name="How to Submit (C++ only)", value=" ".join(how), inline=False)
-
     embed.set_footer(text=f"Day: {problem['day']} • Seed: {problem['seed']}")
     return embed
 
@@ -639,7 +630,6 @@ def _has_user_defined_function(code: str) -> bool:
 
 def _has_array_declaration(code: str) -> bool:
     c = _strip_cpp_comments_and_strings(code)
-
     has_vector = bool(re.search(r"\b(?:std::)?vector\s*<", c))
     has_std_array = bool(re.search(r"\b(?:std::)?array\s*<", c))
 
@@ -669,9 +659,7 @@ def _has_array_indexing_or_loop_over_n(code: str) -> bool:
     c = _strip_cpp_comments_and_strings(code)
     has_bracket_index = bool(re.search(r"\b[_A-Za-z]\w*\s*\[\s*[^\]]+\s*\]", c))
     has_at = bool(re.search(r"\.\s*at\s*\(", c))
-    looks_like_read_n_loop = bool(
-        re.search(r"\bcin\s*>>\s*[_A-Za-z]\w*\s*;", c) and re.search(r"\bfor\s*\(", c)
-    )
+    looks_like_read_n_loop = bool(re.search(r"\bcin\s*>>\s*[_A-Za-z]\w*\s*;", c) and re.search(r"\bfor\s*\(", c))
     return has_bracket_index or has_at or looks_like_read_n_loop
 
 
@@ -799,11 +787,11 @@ def enforce_skill(problem: dict, code: str) -> Tuple[bool, str, float]:
 # =========================
 _TOKEN_RE = re.compile(
     r"""
-    (?:[A-Za-z_]\w*)              # identifiers/keywords
-    |(?:0x[0-9A-Fa-f]+)            # hex ints
-    |(?:\d+\.\d+|\d+)              # numbers
+    (?:[A-Za-z_]\w*)
+    |(?:0x[0-9A-Fa-f]+)
+    |(?:\d+\.\d+|\d+)
     |(?:==|!=|<=|>=|->|::|\+\+|--|\+=|-=|\*=|/=|%=|&&|\|\|)
-    |(?:[^\s])                     # any other single char operator/punct
+    |(?:[^\s])
     """,
     re.VERBOSE,
 )
@@ -1119,22 +1107,22 @@ def validate_config() -> None:
 # HELP TEXT
 # =========================
 def help_text() -> str:
-    p = COMMAND_PREFIX
+    p = PREFIX
     parts = ["**📌 CS1 Daily MP Bot — Commands (Prefix only)**\n"]
     parts += [
-        f"**Student Commands**\n"
-        f"• `{p}help` / `{p} help`\n"
-        f"• `{p}ping` / `{p} ping`\n"
-        f"• `{p}today` / `{p} today`\n"
-        f"• `{p}submit` / `{p} submit`  (paste code or attach .cpp)\n"
-        f"• `{p}rules` / `{p} rules`\n"
-        f"• `{p}explain` / `{p} explain`\n"
-        f"• `{p}approach` / `{p} approach`\n"
-        f"• `{p}hint` / `{p}hint2` / `{p}hint3`\n"
-        f"• `{p}dryrun` / `{p} constraints` / `{p}leaderboard`\n"
-        f"• `{p}whoami` / `{p}whotest`\n\n"
-        f"**Admin Commands**\n"
-        f"• `{p}status` • `{p}postnow` • `{p}reset_today` • `{p}regen_today` • `{p}repost_date YYYY-MM-DD`\n"
+        "**Student Commands**\n"
+        f"• `{p}help`\n"
+        f"• `{p}ping`\n"
+        f"• `{p}today`\n"
+        f"• `{p}submit`  (paste code or attach .cpp)\n"
+        f"• `{p}rules`\n"
+        f"• `{p}explain`\n"
+        f"• `{p}approach`\n"
+        f"• `{p}hint` • `{p}hint2` • `{p}hint3`\n"
+        f"• `{p}dryrun` • `{p}constraints` • `{p}leaderboard`\n"
+        f"• `{p}whoami` • `{p}whotest`\n\n"
+        "**Admin Commands**\n"
+        f"• `{p}status` • `{p}postnow`\n"
     ]
     parts.append(f"\nBuild: `{BOT_UPDATES_VERSION}`")
     return "".join(parts)
@@ -1180,7 +1168,7 @@ async def judge_submission(
         date_str = today_str_ph()
         problem = st.get("problems_by_date", {}).get(date_str)
         if not problem:
-            await result_cb("❌ No active problem for today. Ask admin to post today’s MP.")
+            await result_cb(f"❌ No active problem for today. Ask admin to `{PREFIX}postnow`.")
             return
 
         src, parse_err = await get_code_from_inputs(code_text, attachment)
@@ -1206,7 +1194,6 @@ async def judge_submission(
             if not ok_skill and confidence >= SKILL_WARN_CONFIDENCE:
                 await progress_cb(f"⚠️ Skill-check warning (confidence {confidence:.2f}): {skill_msg}")
 
-        # ---- Anti-plagiarism check (records fingerprint) ----
         if PLAGIARISM_ENABLED:
             ok_plag, plag_msg, plag_sim = plagiarism_check_and_record(
                 st,
@@ -1302,8 +1289,8 @@ async def on_message(message: discord.Message):
         return
 
     content = (message.content or "").strip()
-    # Quick debug ping for prefix visibility:
-    if ENABLE_PREFIX and (content == f"{COMMAND_PREFIX}whotest" or content == f"{COMMAND_PREFIX} whotest"):
+    # debug: "c whotest" OR "C whotest"
+    if ENABLE_PREFIX and (content == f"{PREFIX}whotest" or content == f"{PREFIX_CAP}whotest"):
         try:
             await message.channel.send("✅ I can see messages here (prefix alive).")
         except discord.Forbidden:
@@ -1354,9 +1341,8 @@ if ENABLE_PREFIX:
             f"- Admin perm: `{ctx.author.guild_permissions.administrator}`\n"
             f"- Roles: `{[r.name for r in ctx.author.roles]}`\n"
             f"- ADMIN_ROLES expected: `{ADMIN_ROLES}`\n"
-            f"- ENABLE_PREFIX: `{ENABLE_PREFIX}` Prefix base: `{COMMAND_PREFIX}`\n"
-            f"- message_content intent (code): `{bot.intents.message_content}`\n"
-            f"- Try commands: `{COMMAND_PREFIX}help` or `{COMMAND_PREFIX} help`"
+            f"- Prefix: `{PREFIX}` (type commands like `c help`)\n"
+            f"- message_content intent (code): `{bot.intents.message_content}`"
         )
 
     @bot.command(name="today")
@@ -1364,7 +1350,7 @@ if ENABLE_PREFIX:
         st = load_state()
         p = st.get("problems_by_date", {}).get(today_str_ph())
         if not p:
-            await send_public(ctx, f"❌ No problem stored for today yet. Ask admin to `{COMMAND_PREFIX}postnow` or wait for schedule.")
+            await send_public(ctx, f"❌ No problem stored for today yet. Ask admin to `{PREFIX}postnow` or wait for schedule.")
             return
         await send_public(ctx, embed=build_embed(p))
 
@@ -1373,7 +1359,7 @@ if ENABLE_PREFIX:
         await send_public(
             ctx,
             "**How to Submit (C++ only)**\n"
-            f"Use `{COMMAND_PREFIX}submit` or `{COMMAND_PREFIX} submit` and either:\n"
+            f"Use `{PREFIX}submit` and either:\n"
             "1) Paste your full code after the command (you may include a ```cpp``` block), OR\n"
             "2) Attach a `.cpp` file.\n\n"
             "**No prompts** like `Enter n:` — output must match exactly."
@@ -1387,7 +1373,7 @@ if ENABLE_PREFIX:
     async def p_explain(ctx: commands.Context):
         p = get_today_problem_from_state()
         if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{PREFIX}postnow`.")
             return
         fam = str(p.get("family", "")).lower()
         mapping = {
@@ -1405,7 +1391,7 @@ if ENABLE_PREFIX:
     async def p_approach(ctx: commands.Context):
         p = get_today_problem_from_state()
         if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{PREFIX}postnow`.")
             return
         fam = str(p.get("family", "")).lower()
         steps = ["1) Read input exactly as specified."]
@@ -1418,14 +1404,14 @@ if ENABLE_PREFIX:
         elif fam == "recursion":
             steps += ["2) Identify base case.", "3) Write recursive step.", "4) Call recursive function and print result."]
         else:
-            steps += ["2) Use the required topic tools (see `explain`).", "3) Match output format exactly."]
+            steps += ["2) Use the required topic tools (see `c explain`).", "3) Match output format exactly."]
         await send_public(ctx, "🧩 **Approach (today's problem)**\n" + "\n".join(steps))
 
     @bot.command(name="hint")
     async def p_hint(ctx: commands.Context):
         p = get_today_problem_from_state()
         if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{PREFIX}postnow`.")
             return
         st = load_state()
         ok, used = consume_hint(st, ctx.author.id, today_str_ph())
@@ -1439,7 +1425,7 @@ if ENABLE_PREFIX:
     async def p_hint2(ctx: commands.Context):
         p = get_today_problem_from_state()
         if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{PREFIX}postnow`.")
             return
         st = load_state()
         ok, used = consume_hint(st, ctx.author.id, today_str_ph())
@@ -1454,7 +1440,7 @@ if ENABLE_PREFIX:
     async def p_hint3(ctx: commands.Context):
         p = get_today_problem_from_state()
         if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{PREFIX}postnow`.")
             return
         st = load_state()
         ok, used = consume_hint(st, ctx.author.id, today_str_ph())
@@ -1472,7 +1458,7 @@ if ENABLE_PREFIX:
     async def p_dryrun(ctx: commands.Context):
         p = get_today_problem_from_state()
         if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{PREFIX}postnow`.")
             return
         await send_public(
             ctx,
@@ -1485,7 +1471,7 @@ if ENABLE_PREFIX:
     async def p_constraints(ctx: commands.Context):
         p = get_today_problem_from_state()
         if not p:
-            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{COMMAND_PREFIX}postnow`.")
+            await send_public(ctx, f"❌ No stored problem for today yet. Ask admin to `{PREFIX}postnow`.")
             return
         await send_public(ctx, f"📌 **Constraints**\n{p.get('constraints','-')}")
 
@@ -1523,7 +1509,7 @@ if ENABLE_PREFIX:
             result_cb=result,
         )
 
-    # ---- PREFIX: ADMIN ----
+    # ---- ADMIN ----
     @bot.command(name="status")
     @prefix_admin_only()
     async def p_status(ctx: commands.Context):
@@ -1538,7 +1524,7 @@ if ENABLE_PREFIX:
             "**Bot Status**\n"
             f"- Uptime: `{up}s`\n"
             f"- ENABLE_PREFIX: `{ENABLE_PREFIX}`\n"
-            f"- Prefix base: `{COMMAND_PREFIX}` (supports `{COMMAND_PREFIX}cmd` and `{COMMAND_PREFIX} cmd`)\n"
+            f"- Prefix: `{PREFIX}` (commands like `c help`)\n"
             f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}` (STRICT_ARRAYS={STRICT_ARRAYS}, STRICT_FUNCTIONS={STRICT_FUNCTIONS})\n"
             f"- Plagiarism: enabled={PLAGIARISM_ENABLED} threshold={PLAGIARISM_THRESHOLD}\n"
             f"- Day index: `{di}`\n"
@@ -1602,11 +1588,11 @@ if ENABLE_PREFIX:
 async def on_ready():
     logging.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
     logging.info(
-        "Config: DAILY_CHANNEL_ID=%s SUBMIT_CHANNEL_ID=%s ENABLE_PREFIX=%s PREFIX_BASE=%r ENFORCE_SKILLS=%s ADMIN_ROLES=%s",
+        "Config: DAILY_CHANNEL_ID=%s SUBMIT_CHANNEL_ID=%s ENABLE_PREFIX=%s PREFIX=%r ENFORCE_SKILLS=%s ADMIN_ROLES=%s",
         DAILY_CHANNEL_ID,
         SUBMIT_CHANNEL_ID,
         ENABLE_PREFIX,
-        COMMAND_PREFIX,
+        PREFIX,
         ENFORCE_SKILLS,
         ADMIN_ROLES,
     )
