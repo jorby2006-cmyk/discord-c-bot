@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import re
 import json
-import random
 import hashlib
 import logging
 import datetime
@@ -109,18 +108,18 @@ SKILL_HARD_FAIL_CONFIDENCE = float(os.getenv("SKILL_HARD_FAIL_CONFIDENCE", "0.75
 SKILL_WARN_CONFIDENCE = float(os.getenv("SKILL_WARN_CONFIDENCE", "0.45"))
 HINTS_PER_DAY_LIMIT = int(os.getenv("HINTS_PER_DAY_LIMIT", "5"))
 
-BOT_UPDATES_VERSION = "2026-02-command-system-rewrite"
+BOT_UPDATES_VERSION = "2026-02-checkers-hardened-no-manual-random"
 
 # =========================
 # DISCORD BOT SETUP
 # =========================
 intents = discord.Intents.default()
-# Prefix commands need message_content to see messages
-intents.message_content = True
+intents.message_content = True  # Prefix commands need message_content to see messages
 
-# IMPORTANT: callable prefix prevents weird None behavior and makes logging/debug easier
+
 def _prefix_callable(_bot: commands.Bot, _message: discord.Message):
     return COMMAND_PREFIX if ENABLE_PREFIX else "NO_PREFIX__"
+
 
 bot = commands.Bot(
     command_prefix=_prefix_callable,
@@ -140,25 +139,31 @@ def is_admin_member(member: discord.Member) -> bool:
     except Exception:
         return False
 
+
 def prefix_admin_only():
     async def predicate(ctx: commands.Context) -> bool:
         if not ctx.guild or not isinstance(ctx.author, discord.Member):
             return False
         return is_admin_member(ctx.author)
+
     return commands.check(predicate)
+
 
 def slash_admin_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return False
         return is_admin_member(interaction.user)
+
     return app_commands.check(predicate)
+
 
 # =========================
 # TIME HELPERS
 # =========================
 def today_str_ph() -> str:
     return datetime.datetime.now(PH_TZ).date().isoformat()
+
 
 def next_post_time_ph(now: Optional[datetime.datetime] = None) -> datetime.datetime:
     now = now or datetime.datetime.now(PH_TZ)
@@ -167,6 +172,7 @@ def next_post_time_ph(now: Optional[datetime.datetime] = None) -> datetime.datet
     if now >= candidate:
         candidate = candidate + datetime.timedelta(days=1)
     return candidate
+
 
 # =========================
 # STATE HELPERS
@@ -183,6 +189,7 @@ def default_state() -> dict:
         "audit_log": [],
     }
 
+
 def _state_with_defaults(raw: dict) -> dict:
     base = default_state()
     base.update(raw or {})
@@ -193,6 +200,7 @@ def _state_with_defaults(raw: dict) -> dict:
         base["audit_log"] = []
     return base
 
+
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
         return default_state()
@@ -202,14 +210,17 @@ def load_state() -> dict:
     except Exception:
         return default_state()
 
+
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
+
 
 def append_audit(state: dict, entry: dict) -> None:
     logs = state.get("audit_log", [])
     logs.append({"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), **entry})
     state["audit_log"] = logs[-250:]
+
 
 def cooldown_remaining_sec(state: dict, user_id: int) -> int:
     key = str(user_id)
@@ -217,8 +228,10 @@ def cooldown_remaining_sec(state: dict, user_id: int) -> int:
     until = float(state.get("cooldowns", {}).get(key, 0.0))
     return max(0, int(until - now))
 
+
 def set_cooldown(state: dict, user_id: int, sec: int) -> None:
     state.setdefault("cooldowns", {})[str(user_id)] = time.time() + max(0, sec)
+
 
 def record_compile_error(state: dict, user_id: int, msg: str) -> None:
     state.setdefault("compile_errors", {})[str(user_id)] = {
@@ -226,28 +239,34 @@ def record_compile_error(state: dict, user_id: int, msg: str) -> None:
         "msg": msg[:2000],
     }
 
+
 def current_week_key_ph() -> str:
     now = datetime.datetime.now(PH_TZ).date()
     iso = now.isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
 
+
 def _score_row(state: dict, user_id: int, display: str) -> dict:
     scores = state.setdefault("scores", {})
-    row = scores.get(str(user_id), {
-        "name": display,
-        "accepted": 0,
-        "submissions": 0,
-        "streak": 0,
-        "last_accept_date": None,
-        "week_key": current_week_key_ph(),
-        "weekly_accepts": 0,
-    })
+    row = scores.get(
+        str(user_id),
+        {
+            "name": display,
+            "accepted": 0,
+            "submissions": 0,
+            "streak": 0,
+            "last_accept_date": None,
+            "week_key": current_week_key_ph(),
+            "weekly_accepts": 0,
+        },
+    )
     row["name"] = display
     if row.get("week_key") != current_week_key_ph():
         row["week_key"] = current_week_key_ph()
         row["weekly_accepts"] = 0
     scores[str(user_id)] = row
     return row
+
 
 def score_submission(state: dict, user_id: int, display: str, accepted: bool, date_str: str) -> None:
     row = _score_row(state, user_id, display)
@@ -272,6 +291,7 @@ def score_submission(state: dict, user_id: int, display: str, accepted: bool, da
         row["streak"] = 1
     row["last_accept_date"] = date_str
 
+
 def consume_hint(state: dict, user_id: int, date_str: str) -> Tuple[bool, int]:
     usage = state.setdefault("hint_usage", {})
     per_user = usage.setdefault(str(user_id), {})
@@ -281,6 +301,7 @@ def consume_hint(state: dict, user_id: int, date_str: str) -> Tuple[bool, int]:
     per_user[date_str] = used + 1
     return True, used + 1
 
+
 # =========================
 # PROBLEM MODEL
 # =========================
@@ -289,14 +310,37 @@ class TestCase:
     inp: str
     out: str
 
+
 def stable_seed_for_day(day_index: int, date_str: str) -> int:
     h = hashlib.sha256(f"{day_index}|{date_str}|CS1JUDGE".encode("utf-8")).hexdigest()
     return int(h[:16], 16)
 
+
 def pick_family(day_index: int) -> str:
-    families = ["arrays_basic", "arrays_nested", "bool_checks", "functions", "patterns",
-                "strings", "math_logic", "recursion", "stl_intro"]
+    families = [
+        "arrays_basic",
+        "arrays_nested",
+        "bool_checks",
+        "functions",
+        "patterns",
+        "strings",
+        "math_logic",
+        "recursion",
+        "stl_intro",
+    ]
     return families[day_index % len(families)]
+
+
+def pick_kind_for_family(family: str, seed: int) -> Optional[str]:
+    """
+    Deterministic kind selection (no 'random' manual tools).
+    Uses seed mod N so it stays stable for a given day+day_index.
+    """
+    kinds = family_kinds.get(family)
+    if not kinds:
+        return None
+    return kinds[seed % len(kinds)]
+
 
 def normalize_output(s: str) -> str:
     s = s.replace("\r\n", "\n").replace("\r", "\n")
@@ -305,34 +349,66 @@ def normalize_output(s: str) -> str:
         lines.pop()
     return "\n".join(lines) + ("\n" if lines else "")
 
+
 def generate_problem(day_index: int, date_str: str) -> dict:
     seed = stable_seed_for_day(day_index, date_str)
-    rng = random.Random(seed)
 
     family = pick_family(day_index)
-    if family == "arrays_basic":
-        p = gen_arrays_basic(rng)
-    elif family == "arrays_nested":
-        p = gen_arrays_nested(rng)
-    elif family == "bool_checks":
-        p = gen_bool_checks(rng)
-    elif family == "functions":
-        p = gen_functions(rng)
-    elif family == "patterns":
-        p = gen_patterns(rng)
-    elif family == "strings":
-        p = gen_strings(rng)
-    elif family == "math_logic":
-        p = gen_math_logic(rng)
-    elif family == "recursion":
-        p = gen_recursion(rng)
-    else:
-        p = gen_stl_intro(rng)
+    kind = pick_kind_for_family(family, seed)
 
+    # NOTE: generators are expected to use rng deterministically if they do internal randomness.
+    # We keep their RNG deterministic too, but "random" is not exposed as a manual admin command anymore.
+    rng = __import__("random").Random(seed)
+
+    try:
+        if family == "arrays_basic":
+            p = gen_arrays_basic(rng, kind=kind) if kind else gen_arrays_basic(rng)
+        elif family == "arrays_nested":
+            p = gen_arrays_nested(rng, kind=kind) if kind else gen_arrays_nested(rng)
+        elif family == "bool_checks":
+            p = gen_bool_checks(rng, kind=kind) if kind else gen_bool_checks(rng)
+        elif family == "functions":
+            p = gen_functions(rng, kind=kind) if kind else gen_functions(rng)
+        elif family == "patterns":
+            p = gen_patterns(rng, kind=kind) if kind else gen_patterns(rng)
+        elif family == "strings":
+            p = gen_strings(rng, kind=kind) if kind else gen_strings(rng)
+        elif family == "math_logic":
+            p = gen_math_logic(rng, kind=kind) if kind else gen_math_logic(rng)
+        elif family == "recursion":
+            p = gen_recursion(rng, kind=kind) if kind else gen_recursion(rng)
+        else:
+            p = gen_stl_intro(rng, kind=kind) if kind else gen_stl_intro(rng)
+    except TypeError:
+        # If any generator doesn't accept `kind`, fallback safely.
+        if family == "arrays_basic":
+            p = gen_arrays_basic(rng)
+        elif family == "arrays_nested":
+            p = gen_arrays_nested(rng)
+        elif family == "bool_checks":
+            p = gen_bool_checks(rng)
+        elif family == "functions":
+            p = gen_functions(rng)
+        elif family == "patterns":
+            p = gen_patterns(rng)
+        elif family == "strings":
+            p = gen_strings(rng)
+        elif family == "math_logic":
+            p = gen_math_logic(rng)
+        elif family == "recursion":
+            p = gen_recursion(rng)
+        else:
+            p = gen_stl_intro(rng)
+
+    # annotate
     p["day"] = date_str
     p["seed"] = seed
     p["day_index"] = day_index
+    p["family"] = p.get("family", family)
+    if kind:
+        p["kind"] = p.get("kind", kind)
     return p
+
 
 # =========================
 # EMBED BUILDER
@@ -350,6 +426,9 @@ def build_embed(problem: dict) -> discord.Embed:
     )
     if problem.get("note"):
         desc += f"\n**Note**\n{problem['note']}\n"
+
+    if problem.get("kind"):
+        desc += f"\n**Kind**\n`{problem['kind']}`\n"
 
     embed = discord.Embed(
         title=title,
@@ -371,15 +450,20 @@ def build_embed(problem: dict) -> discord.Embed:
     embed.set_footer(text=f"Day: {problem['day']} • Seed: {problem['seed']}")
     return embed
 
+
 # =========================
 # CODE EXTRACTION
 # =========================
 CODE_BLOCK_RE = re.compile(r"```(?:cpp|c\+\+)?\s*([\s\S]*?)```", re.IGNORECASE)
 
+
 def extract_cpp_blocks(content: str) -> List[str]:
     return [m.group(1).strip() for m in CODE_BLOCK_RE.finditer(content or "") if m.group(1).strip()]
 
-async def get_code_from_inputs(code_text: Optional[str], attachment: Optional[discord.Attachment]) -> Tuple[Optional[str], Optional[str]]:
+
+async def get_code_from_inputs(
+    code_text: Optional[str], attachment: Optional[discord.Attachment]
+) -> Tuple[Optional[str], Optional[str]]:
     candidates: List[Tuple[str, str]] = []
 
     if code_text:
@@ -410,8 +494,10 @@ async def get_code_from_inputs(code_text: Optional[str], attachment: Optional[di
         return None, f"{ERR_AMBIGUOUS_CODE}: Found multiple code payloads ({names}{suffix}). Submit exactly one payload."
     return candidates[0][1], None
 
+
 def exe_path(workdir: str) -> str:
     return os.path.join(workdir, "main.exe" if IS_WINDOWS else "main.out")
+
 
 # =========================
 # BETTER DIFF UTILITIES
@@ -427,11 +513,13 @@ def first_mismatch_line(expected: str, got: str) -> Tuple[int, str, str]:
             return i + 1, e, g
     return 0, "", ""
 
+
 def clamp_block(s: str, limit: int = 1200) -> str:
     s = s if s.endswith("\n") else s + "\n"
     if len(s) <= limit:
         return s
     return s[:limit] + "\n... (truncated)\n"
+
 
 # =========================
 # TUTOR HELPERS
@@ -441,165 +529,289 @@ def get_today_problem_from_state() -> Optional[dict]:
     date_str = today_str_ph()
     return st.get("problems_by_date", {}).get(date_str)
 
+
 def tutor_hints(problem: dict) -> List[str]:
     fam = str(problem.get("family", "")).lower()
     by_family: Dict[str, List[str]] = {
         "arrays_basic": [
             "Read **n**, then read **n numbers**. Store them in an array/vector so you can process them using `a[i]`.",
             "Use `vector<long long> a(n); for (int i=0;i<n;i++) cin>>a[i];` then compute the required value in a loop.",
-            "Double-check you print **only** what the problem asks (no extra spaces/prompts)."
+            "Double-check you print **only** what the problem asks (no extra spaces/prompts).",
         ],
         "arrays_nested": [
             "This one usually needs **nested loops** (a loop inside a loop) + an array/matrix.",
             "If it's 2D: store inputs, then use `for (i) for (j)` to compute the required value.",
-            "Outer loop = rows, inner loop = columns. Avoid `map`/`unordered_map` if disallowed."
+            "Outer loop = rows, inner loop = columns. Avoid `map`/`unordered_map` if disallowed.",
         ],
         "bool_checks": [
             "Compute the condition using comparisons (`<`, `>`, `==`, etc.).",
             "Store it in `bool ok = (condition);` then print exactly what’s required (`YES/NO` or `1/0`).",
-            "Be careful with boundary cases (equal, negative, etc.)."
+            "Be careful with boundary cases (equal, negative, etc.).",
         ],
         "functions": [
             "Your instructor wants a **user-defined function** besides `main()`.",
             "Write a helper function that does the core work, then call it from `main()`.",
-            "Keep I/O in `main()`, logic inside the function if possible."
+            "Keep I/O in `main()`, logic inside the function if possible.",
         ],
         "patterns": [
             "Patterns are about **loops + printing**. Print line by line.",
             "Figure out how many rows; outer loop controls rows; inner loop prints characters.",
-            "Print `\\n` after each row; don’t print extra lines."
+            "Print `\\n` after each row; don’t print extra lines.",
         ],
         "strings": [
             "Use `string` / `getline` as required. Read input carefully (line vs token).",
             "If processing characters: loop through the string and apply conditions.",
-            "Remember: `getline(cin, s)` reads spaces; `cin >> s` does not."
+            "Remember: `getline(cin, s)` reads spaces; `cin >> s` does not.",
         ],
         "math_logic": [
             "Write the math/formula first, then implement carefully. Watch integer division.",
             "Test with small numbers and edge cases (0, 1, negatives if allowed).",
-            "Use `long long` if values can get large."
+            "Use `long long` if values can get large.",
         ],
         "recursion": [
             "This requires a **recursive function** (it calls itself).",
             "Define a base case that stops recursion, then reduce the input each call.",
-            "Avoid infinite recursion: make sure it progresses toward the base case."
+            "Avoid infinite recursion: make sure it progresses toward the base case.",
         ],
         "stl_intro": [
             "Use STL containers/algorithms (`vector`, `sort`, `set`, `map`) as required.",
             "For ordering tasks, `vector + sort` is usually enough.",
-            "Make sure output formatting matches exactly."
+            "Make sure output formatting matches exactly.",
         ],
     }
     return by_family.get(fam, ["Read the problem carefully.", "Follow the I/O format exactly.", "Test using the sample I/O."])
 
+
 # =========================
-# SKILL ENFORCEMENT (heuristics)
+# SKILL ENFORCEMENT (hardened heuristics)
 # =========================
+_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+_CHAR_RE = re.compile(r"'(?:\\.|[^'\\])*'")
+_BLOCK_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/")
+_LINE_COMMENT_RE = re.compile(r"//.*?$", re.MULTILINE)
+
+
 def _strip_cpp_comments_and_strings(code: str) -> str:
-    code = re.sub(r"//.*?$", "", code, flags=re.MULTILINE)
-    code = re.sub(r"/\*[\s\S]*?\*/", "", code)
-    code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
-    code = re.sub(r"'(?:\\.|[^'\\])*'", "''", code)
+    """
+    Safer order:
+    1) replace strings/chars so '//' inside them won't get treated as a comment
+    2) remove /* */ block comments
+    3) remove // line comments
+    """
+    if not code:
+        return ""
+    code = _STRING_RE.sub('""', code)
+    code = _CHAR_RE.sub("''", code)
+    code = _BLOCK_COMMENT_RE.sub("", code)
+    code = _LINE_COMMENT_RE.sub("", code)
     return code
+
 
 def _has_user_defined_function(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
+
+    # Detect function definitions (not prototypes) by requiring '{' after signature.
+    # Works for: return_type name(args) { ... }
     fn_pat = re.compile(
-        r"(?mx)^\s*(?:template\s*<[^>]+>\s*)?"
-        r"(?:static\s+|inline\s+|constexpr\s+|friend\s+)?"
-        r"(?:[\w:\<\>\,\&\*\s]+?)\s+"
-        r"([A-Za-z_]\w*)\s*\([^;]*\)\s*(?:const\s*)?\{"
+        r"""
+        (?mx)
+        ^\s*
+        (?:template\s*<[^>]+>\s*)?
+        (?:static\s+|inline\s+|constexpr\s+|friend\s+)?
+        (?:[\w:\<\>\,\&\*\s]+?)\s+
+        (?P<name>[A-Za-z_]\w*)
+        \s*\([^;{}]*\)
+        \s*(?:const\s*)?
+        (?:noexcept\s*)?
+        \{
+        """,
     )
-    names = [m.group(1) for m in fn_pat.finditer(code)]
-    return any(n != "main" for n in names)
+    for m in fn_pat.finditer(code):
+        if m.group("name") != "main":
+            return True
+    return False
+
 
 def _has_array_usage(code: str) -> bool:
+    """
+    Fix: detect C-style arrays even with initializers:
+      int a[n] = {};
+      long long a[100] = {0};
+    And detect vector/array + indexing patterns robustly.
+    """
     code = _strip_cpp_comments_and_strings(code)
+
     has_vector = bool(re.search(r"\b(?:std::)?vector\s*<", code))
-    has_array = bool(re.search(r"\b(?:std::)?array\s*<", code))
-    has_c_array_decl = bool(re.search(
-        r"\b(?:bool|char|short|int|long|long\s+long|float|double|string|std::string)\s+\w+\s*\[\s*\w*\s*\]\s*;",
-        code
-    ))
-    has_index = bool(re.search(r"\[[^\]]+\]", code))
-    return (has_vector or has_array or has_c_array_decl) and has_index
+    has_std_array = bool(re.search(r"\b(?:std::)?array\s*<", code))
+
+    # More permissive type head (supports unsigned/long long/etc.)
+    c_array_decl = re.compile(
+        r"""
+        (?x)
+        \b
+        (?:
+            (?:unsigned\s+)?(?:long\s+long|long|int|short|char|bool) |
+            float|double |
+            (?:std::)?string |
+            (?:std::)?wstring
+        )
+        \b
+        (?:\s+const)?\s+
+        [_A-Za-z]\w*
+        \s*\[\s*[^\]]+\s*\]
+        \s*(?:=\s*[^;]*)?
+        \s*;
+        """
+    )
+    has_c_array_decl = bool(c_array_decl.search(code))
+
+    # Indexing / access
+    has_bracket_index = bool(re.search(r"\b[_A-Za-z]\w*\s*\[\s*[^\]]+\s*\]", code))
+    has_at = bool(re.search(r"\.\s*at\s*\(", code))
+
+    # If they declared an array, we accept even if they don't index it (arrays_basic should be less annoying).
+    # For arrays_nested, nested-loop check still exists.
+    return (has_vector or has_std_array or has_c_array_decl) and (has_bracket_index or has_at or has_c_array_decl)
+
 
 def _has_nested_loops(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    pat = re.compile(r"(for|while)\s*\([^\)]*\)\s*\{[\s\S]{0,800}?(for|while)\s*\(", re.MULTILINE)
-    if pat.search(code):
-        return True
-    return len(re.findall(r"\bfor\b|\bwhile\b", code)) >= 2
+    # Don't try to prove perfect nesting; we want to avoid false negatives.
+    # A practical signal: a loop appears inside a brace block that also contains another loop.
+    # Fallback: at least two loops anywhere.
+    if len(re.findall(r"\bfor\b|\bwhile\b", code)) < 2:
+        return False
+    pat = re.compile(r"(for|while)\s*\([^\)]*\)\s*\{[\s\S]{0,5000}?(for|while)\s*\(", re.MULTILINE)
+    return bool(pat.search(code))
+
 
 def _has_bool_logic(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
     return bool(re.search(r"\bbool\b|\btrue\b|\bfalse\b|==|!=|<=|>=|<|>", code))
 
+
 def _has_string_usage(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    return bool(re.search(r"\b(?:std::)?string\b|getline\s*\(", code))
+    return bool(re.search(r"\b(?:std::)?string\b|\b(?:std::)?wstring\b|getline\s*\(", code))
+
 
 def _has_pattern_printing(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
     has_loop = bool(re.search(r"\bfor\b|\bwhile\b", code))
     uses_cout = "cout" in code
-    has_star_or_hash = ("*" in code) or ("#" in code)
-    return has_loop and uses_cout and (has_star_or_hash or _has_nested_loops(code))
+    # don't require '*' or '#': many patterns print digits/letters/spaces
+    prints_something = bool(re.search(r"\bcout\s*<<", code))
+    return has_loop and uses_cout and prints_something
+
 
 def _has_math_logic_ops(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    return bool(re.search(r"%|\bsqrt\s*\(|\babs\s*\(|/|\*|\+|-", code))
+    # include common math functions too
+    return bool(
+        re.search(
+            r"%|\bsqrt\s*\(|\babs\s*\(|\bpow\s*\(|/|\*|\+|-|\bmin\s*\(|\bmax\s*\(",
+            code,
+        )
+    )
+
 
 def _has_recursion(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    fn_pat = re.compile(r"(?mx)^\s*(?:[\w:\<\>\,\&\*\s]+?)\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*\{")
-    names = [m.group(1) for m in fn_pat.finditer(code)]
-    names = [n for n in names if n != "main"]
+
+    # Find function definitions (avoid prototypes)
+    fn_pat = re.compile(
+        r"""
+        (?mx)
+        ^\s*
+        (?:template\s*<[^>]+>\s*)?
+        (?:static\s+|inline\s+|constexpr\s+)?
+        (?:[\w:\<\>\,\&\*\s]+?)\s+
+        (?P<name>[A-Za-z_]\w*)
+        \s*\([^;{}]*\)
+        \s*(?:const\s*)?
+        (?:noexcept\s*)?
+        \{
+        """,
+    )
+    names = [m.group("name") for m in fn_pat.finditer(code) if m.group("name") != "main"]
     for n in names:
-        if len(re.findall(rf"\b{re.escape(n)}\s*\(", code)) >= 2:
+        # definition counts once; recursion needs at least one additional call
+        # Use word boundary to avoid matching substrings.
+        calls = len(re.findall(rf"\b{re.escape(n)}\s*\(", code))
+        if calls >= 2:
             return True
     return False
 
+
 def _has_stl_usage(code: str) -> bool:
     code = _strip_cpp_comments_and_strings(code)
-    return bool(re.search(r"\b(?:std::)?vector\s*<|\b(?:std::)?set\s*<|\b(?:std::)?map\s*<|\bunordered_map\s*<|\b(?:std::)?sort\s*\(", code))
+    return bool(
+        re.search(
+            r"\b(?:std::)?vector\s*<"
+            r"|\b(?:std::)?set\s*<"
+            r"|\b(?:std::)?map\s*<"
+            r"|\bunordered_(?:map|set)\s*<"
+            r"|\b(?:std::)?sort\s*\("
+            r"|\b(?:std::)?unique\s*\("
+            r"|\b(?:std::)?lower_bound\s*\("
+            r"|\b(?:std::)?upper_bound\s*\(",
+            code,
+        )
+    )
+
 
 def enforce_skill(problem: dict, code: str) -> Tuple[bool, str, float]:
     fam = str(problem.get("family", "")).lower()
 
     if fam == "arrays_basic":
+        # Hardened: accept C-array declarations with initializers, vectors, etc.
+        # Also accept "read n + loop n times" in case teacher allows not storing.
         if not _has_array_usage(code):
-            return False, "❌ **ARRAYS (basic)**: I didn’t detect array/vector + indexing like `a[i]`.", 0.85
+            c = _strip_cpp_comments_and_strings(code)
+            looks_like_read_n_loop = bool(
+                re.search(r"\bcin\s*>>\s*[_A-Za-z]\w*\s*;", c) and re.search(r"\bfor\s*\(", c)
+            )
+            if not looks_like_read_n_loop:
+                return False, "❌ **ARRAYS (basic)**: I didn’t detect arrays/vectors OR a typical `read n + loop n times` structure.", 0.70
+
     elif fam == "arrays_nested":
         if not _has_array_usage(code):
-            return False, "❌ **ARRAYS (nested)**: I didn’t detect array/vector + indexing like `a[i]`.", 0.85
+            return False, "❌ **ARRAYS (nested)**: I didn’t detect array/vector + indexing (or array declaration).", 0.80
         if not _has_nested_loops(code):
-            return False, "❌ **ARRAYS (nested)**: I didn’t detect **nested loops** (e.g., `for` inside `for`).", 0.8
-        if re.search(r"\bmap\b|\bunordered_map\b", _strip_cpp_comments_and_strings(code)):
+            return False, "❌ **ARRAYS (nested)**: I didn’t detect **nested loops** (e.g., `for` inside `for`).", 0.75
+        if re.search(r"\bunordered_map\b|\bmap\b", _strip_cpp_comments_and_strings(code)):
             return False, "❌ **ARRAYS (nested)**: `map`/`unordered_map` not allowed. Use loops as required.", 0.95
+
     elif fam == "bool_checks":
         if not _has_bool_logic(code):
             return False, "❌ **BOOL CHECKS**: I didn’t detect boolean logic (`bool`, comparisons, true/false).", 0.55
+
     elif fam == "functions":
         if not _has_user_defined_function(code):
             return False, "❌ **FUNCTIONS**: Define at least one user-defined function (besides `main`).", 0.85
+
     elif fam == "patterns":
         if not _has_pattern_printing(code):
-            return False, "❌ **PATTERNS**: Use loops to print the pattern (typically `cout` inside loops).", 0.5
+            return False, "❌ **PATTERNS**: Use loops to print a pattern (`cout <<` inside loops).", 0.50
+
     elif fam == "strings":
         if not _has_string_usage(code):
-            return False, "❌ **STRINGS**: Use `string`/`std::string` or `getline`.", 0.6
+            return False, "❌ **STRINGS**: Use `string`/`std::string` or `getline`.", 0.60
+
     elif fam == "math_logic":
         if not _has_math_logic_ops(code):
-            return False, "❌ **MATH/LOGIC**: I didn’t detect typical math ops (`%`, arithmetic, etc.).", 0.4
+            return False, "❌ **MATH/LOGIC**: I didn’t detect typical math ops (arithmetic, %, sqrt/abs, etc.).", 0.40
+
     elif fam == "recursion":
         if not _has_recursion(code):
-            return False, "❌ **RECURSION**: I didn’t detect a recursive function (a function calling itself).", 0.9
+            return False, "❌ **RECURSION**: I didn’t detect a recursive function (a function calling itself).", 0.90
+
     elif fam == "stl_intro":
         if not _has_stl_usage(code):
             return False, "❌ **STL INTRO**: Use STL (e.g., `vector`, `set`, `map`, or `sort`).", 0.75
 
     return True, "", 1.0
+
 
 # =========================
 # SUBPROCESS + JUDGE
@@ -608,7 +820,7 @@ async def run_subprocess(
     cmd: List[str],
     stdin_data: Optional[bytes],
     timeout_sec: int,
-    cwd: Optional[str] = None
+    cwd: Optional[str] = None,
 ) -> Tuple[int, bytes, bytes, bool]:
     creationflags = 0
     if IS_WINDOWS:
@@ -616,15 +828,18 @@ async def run_subprocess(
 
     preexec = None
     if not IS_WINDOWS:
+
         def _limit_resources() -> None:
             try:
                 import resource
+
                 mem = MAX_RUN_MEMORY_MB * 1024 * 1024
                 resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
                 resource.setrlimit(resource.RLIMIT_CPU, (MAX_RUN_CPU_SEC, MAX_RUN_CPU_SEC + 1))
                 resource.setrlimit(resource.RLIMIT_NPROC, (MAX_RUN_NPROC, MAX_RUN_NPROC))
             except Exception:
                 pass
+
         preexec = _limit_resources
 
     proc = await asyncio.create_subprocess_exec(
@@ -645,9 +860,13 @@ async def run_subprocess(
         try:
             if IS_WINDOWS:
                 killp = await asyncio.create_subprocess_exec(
-                    "taskkill", "/PID", str(proc.pid), "/T", "/F",
+                    "taskkill",
+                    "/PID",
+                    str(proc.pid),
+                    "/T",
+                    "/F",
                     stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL
+                    stderr=asyncio.subprocess.DEVNULL,
                 )
                 await killp.communicate()
             else:
@@ -655,6 +874,7 @@ async def run_subprocess(
         except Exception:
             pass
         return -999, b"", b"TIMEOUT", False
+
 
 async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
     src = os.path.join(workdir, "main.cpp")
@@ -677,7 +897,13 @@ async def compile_cpp(code: str, workdir: str) -> Tuple[bool, str]:
         return False, f"{ERR_COMPILE_TIMEOUT}: Compilation timed out."
 
     msg = (out.decode("utf-8", errors="replace") + "\n" + err.decode("utf-8", errors="replace")).strip()
-    return False, (f"{ERR_COMPILE_FAIL}: " + msg) if msg else f"{ERR_COMPILE_FAIL}: Compilation failed (no output). Check that GPP points to g++."
+    return (
+        False,
+        (f"{ERR_COMPILE_FAIL}: " + msg)
+        if msg
+        else f"{ERR_COMPILE_FAIL}: Compilation failed (no output). Check that GPP points to g++.",
+    )
+
 
 async def run_one_test(workdir: str, t: Dict[str, Any]) -> Tuple[bool, str, Optional[dict]]:
     exe = exe_path(workdir)
@@ -705,6 +931,7 @@ async def run_one_test(workdir: str, t: Dict[str, Any]) -> Tuple[bool, str, Opti
         return False, f"{ERR_WRONG_ANSWER}: Wrong Answer", {"test": t, "expected": expected, "got": got, "kind": "wa"}
 
     return True, "OK", None
+
 
 # =========================
 # DAILY LOOP
@@ -741,16 +968,19 @@ async def post_daily_problem():
 
     logging.info("Posted MP for %s (day_index=%s).", date_str, day_index)
 
+
 @post_daily_problem.before_loop
 async def before_post_daily():
     await bot.wait_until_ready()
     logging.info("CS1 Judge armed.")
+
 
 # =========================
 # STARTUP CHECKS
 # =========================
 def _die(msg: str) -> None:
     raise RuntimeError(f"{ERR_CONFIG}: {msg}")
+
 
 def validate_config() -> None:
     if not TOKEN:
@@ -763,6 +993,7 @@ def validate_config() -> None:
         _die("MAX_CODE_BYTES must be > 0.")
     if not (shutil.which(GPP) or os.path.exists(GPP)):
         logging.warning("%s: GPP binary not found on startup: %s", ERR_CONFIG, GPP)
+
 
 # =========================
 # HELP TEXT
@@ -778,7 +1009,6 @@ def help_text() -> str:
             f"• `{COMMAND_PREFIX}whoami` • `{COMMAND_PREFIX}whotest`\n\n"
             f"**Prefix (Admin)**\n"
             f"• `{COMMAND_PREFIX}status` • `{COMMAND_PREFIX}postnow` • `{COMMAND_PREFIX}reset_today` • `{COMMAND_PREFIX}regen_today` • `{COMMAND_PREFIX}repost_date YYYY-MM-DD`\n"
-            f"• `{COMMAND_PREFIX}dev help|list|random [family]|pick <family> <kind>|setup`\n"
         ]
     if ENABLE_SLASH:
         parts += [
@@ -786,10 +1016,11 @@ def help_text() -> str:
             "• `/help` • `/ping` • `/today` • `/submit` • `/rules` • `/format` • `/explain` • `/approach`\n"
             "• `/hint` • `/hint2` • `/hint3` • `/dryrun` • `/constraints` • `/leaderboard`\n\n"
             "**Slash (Admin)**\n"
-            "• `/status` • `/postnow` • `/reset_today` • `/regen_today` • `/repost_date` • `/dev ...`\n"
+            "• `/status` • `/postnow` • `/reset_today` • `/regen_today` • `/repost_date`\n"
         ]
     parts.append(f"\nBuild: `{BOT_UPDATES_VERSION}`")
     return "".join(parts)
+
 
 # =========================
 # SHARED “SEND” HELPERS
@@ -800,8 +1031,10 @@ async def send_ephemeral(interaction: discord.Interaction, content: str = "", *,
     else:
         await interaction.response.send_message(content, embed=embed, ephemeral=True)
 
+
 async def send_public(ctx: commands.Context, content: str = "", *, embed: Optional[discord.Embed] = None) -> None:
     await ctx.send(content, embed=embed)
+
 
 # =========================
 # SHARED SUBMISSION PIPELINE
@@ -853,12 +1086,17 @@ async def judge_submission(
             return
 
         if re.search(r'cout\s*<<\s*".*(enter|input|please)', src, flags=re.IGNORECASE):
-            await progress_cb("⚠️ Heads up: prompts like `Enter n:` often cause Wrong Answer. Output should be answer only.")
+            await progress_cb(
+                "⚠️ Heads up: prompts like `Enter n:` often cause Wrong Answer. Output should be answer only."
+            )
 
         if ENFORCE_SKILLS:
             ok_skill, skill_msg, confidence = enforce_skill(problem, src)
             if not ok_skill and confidence >= SKILL_HARD_FAIL_CONFIDENCE:
-                await result_cb(skill_msg + f"\n(Confidence: {confidence:.2f}. Teacher: set `ENFORCE_SKILLS=false` to disable.)")
+                await result_cb(
+                    skill_msg
+                    + f"\n(Confidence: {confidence:.2f}. Teacher: set `ENFORCE_SKILLS=false` to disable.)"
+                )
                 return
             if not ok_skill and confidence >= SKILL_WARN_CONFIDENCE:
                 await progress_cb(f"⚠️ Skill-check warning (confidence {confidence:.2f}): {skill_msg}")
@@ -912,7 +1150,9 @@ async def judge_submission(
                             f"**Got**\n```text\n{clamp_block(got, 900)}```"
                         )
                         if line_no:
-                            msg += f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
+                            msg += (
+                                f"\n🔎 First mismatch at **line {line_no}**:\n- expected: `{e_line}`\n- got: `{g_line}`"
+                            )
                     else:
                         if tinp:
                             msg += f"**Input**\n```text\n{clamp_block(tinp, 1200)}```"
@@ -924,7 +1164,10 @@ async def judge_submission(
             score_submission(st, user_id, user_display, accepted=True, date_str=date_str)
             save_state(st)
 
-            await result_cb(f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.\nProblem: **{problem['title']}** (Day {problem['day']})")
+            await result_cb(
+                f"✅ Accepted — {len(tests)}/{len(tests)} tests passed.\nProblem: **{problem['title']}** (Day {problem['day']})"
+            )
+
 
 # =========================
 # COMMAND SYSTEM FIXES
@@ -947,6 +1190,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error: Exception):
     if isinstance(error, CommandNotFound):
@@ -963,6 +1207,7 @@ async def on_command_error(ctx: commands.Context, error: Exception):
 
     logging.exception("Command error: %s", error)
     await ctx.send(f"❌ Command error: `{type(error).__name__}`")
+
 
 # =========================
 # SLASH COMMANDS
@@ -1030,13 +1275,21 @@ if ENABLE_SLASH:
         fam = str(p.get("family", "")).lower()
         steps = ["1) Read input exactly as specified."]
         if fam == "arrays_basic":
-            steps += ["2) Store the n values in `vector<long long> a(n)`.","3) Loop through `a[i]` to compute the required result.","4) Print the result only (no prompts)."]
+            steps += [
+                "2) If required, store values in `vector<long long> a(n)`.",
+                "3) Loop through the values to compute the result.",
+                "4) Print the result only (no prompts).",
+            ]
         elif fam == "arrays_nested":
-            steps += ["2) Store the data (often 2D / multiple values).","3) Use nested loops (`for` inside `for`) to compute.","4) Print result only."]
+            steps += [
+                "2) Store the data (often 2D / multiple values).",
+                "3) Use nested loops (`for` inside `for`) to compute.",
+                "4) Print result only.",
+            ]
         elif fam == "functions":
-            steps += ["2) Write a helper function that solves the core task.","3) Call it from `main()` and print the return value."]
+            steps += ["2) Write a helper function that solves the core task.", "3) Call it from `main()` and print the return value."]
         elif fam == "recursion":
-            steps += ["2) Identify base case.","3) Write recursive step reducing the problem size.","4) Call the recursive function and print the result."]
+            steps += ["2) Identify base case.", "3) Write recursive step reducing the problem size.", "4) Call the recursive function and print the result."]
         else:
             steps += ["2) Use the required topic tools (see `/explain`).", "3) Match output format exactly."]
         await send_ephemeral(interaction, "🧩 **Approach (today's problem)**\n" + "\n".join(steps))
@@ -1119,7 +1372,9 @@ if ENABLE_SLASH:
         rows.sort(key=lambda r: (int(r.get("weekly_accepts", 0)), int(r.get("accepted", 0))), reverse=True)
         lines = ["🏆 **Weekly Leaderboard**"]
         for i, r in enumerate(rows[:10], start=1):
-            lines.append(f"{i}. **{r.get('name','user')}** — weekly `{r.get('weekly_accepts',0)}` | total `{r.get('accepted',0)}` | streak `{r.get('streak',0)}`")
+            lines.append(
+                f"{i}. **{r.get('name','user')}** — weekly `{r.get('weekly_accepts',0)}` | total `{r.get('accepted',0)}` | streak `{r.get('streak',0)}`"
+            )
         await interaction.response.send_message("\n".join(lines))
 
     @tree.command(name="submit", description="Submit your C++ solution (paste code or attach .cpp)")
@@ -1219,24 +1474,30 @@ if ENABLE_SLASH:
         save_state(st)
         await send_ephemeral(interaction, "✅ Reset done. Use `/postnow` to post a new problem for today.")
 
-    @tree.command(name="regen_today", description="Admin: regenerate today's problem (new seed)")
+    @tree.command(name="regen_today", description="Admin: regenerate today's problem (advance to next day_index)")
     @slash_admin_only()
     async def slash_regen_today(interaction: discord.Interaction):
+        """
+        No manual random. This advances day_index and stores a new deterministic problem for today.
+        """
         st = load_state()
         date_str = today_str_ph()
+
+        # advance index explicitly
         di = int(st.get("day_index", 0))
         p = generate_problem(di, date_str)
+
         st.setdefault("problems_by_date", {})[date_str] = p
         st["day_index"] = di + 1
         st["last_posted_date"] = date_str
-        append_audit(st, {"action": "regen_today", "by": str(interaction.user), "day_index": di, "seed": p.get("seed")})
+        append_audit(st, {"action": "regen_today", "by": str(interaction.user), "day_index": di, "seed": p.get("seed"), "kind": p.get("kind")})
         save_state(st)
 
         ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
         if ch and isinstance(ch, discord.abc.Messageable):
-            await ch.send("⚙️ **DAILY MP DROP (regenerated):**", embed=build_embed(p))
+            await ch.send("⚙️ **DAILY MP DROP (regenerated / next in sequence):**", embed=build_embed(p))
 
-        await send_ephemeral(interaction, f"✅ Regenerated today's problem (seed={p.get('seed')}).")
+        await send_ephemeral(interaction, f"✅ Regenerated (next in sequence). seed={p.get('seed')} kind={p.get('kind')}")
 
     @tree.command(name="repost_date", description="Admin: repost stored problem for a date (YYYY-MM-DD)")
     @slash_admin_only()
@@ -1256,171 +1517,12 @@ if ENABLE_SLASH:
         save_state(st)
         await send_ephemeral(interaction, "✅ Reposted.")
 
-    dev = app_commands.Group(name="dev", description="Admin: dev tools")
-
-    @dev.command(name="help", description="Show dev commands")
-    @slash_admin_only()
-    async def dev_help(interaction: discord.Interaction):
-        await send_ephemeral(
-            interaction,
-            "**DEV COMMANDS:**\n"
-            "`/dev list` → list all families/kinds\n"
-            "`/dev random [family]` → pick random problem\n"
-            "`/dev pick <family> <kind>` → pick specific problem\n"
-            "`/dev setup` → show runtime config\n"
-        )
-
-    @dev.command(name="setup", description="Show runtime config")
-    @slash_admin_only()
-    async def dev_setup(interaction: discord.Interaction):
-        ch = bot.get_channel(DAILY_CHANNEL_ID) if DAILY_CHANNEL_ID else None
-        await send_ephemeral(
-            interaction,
-            f"✅ Bot online.\n"
-            f"- Daily channel ID: `{DAILY_CHANNEL_ID}` (name: `{getattr(ch, 'name', None)}`)\n"
-            f"- Submit channel ID: `{SUBMIT_CHANNEL_ID}` (0 means any channel)\n"
-            f"- Post time: `{POST_TIME}` (PH time)\n"
-            f"- ENFORCE_SKILLS: `{ENFORCE_SKILLS}`\n"
-            f"- Windows mode: `{IS_WINDOWS}`\n"
-            f"- GPP: `{GPP}`\n"
-            f"- ADMIN_ROLES: `{ADMIN_ROLES}`\n"
-        )
-
-    @dev.command(name="list", description="List all families and kinds")
-    @slash_admin_only()
-    async def dev_list(interaction: discord.Interaction):
-        msg = "**FAMILIES AND KINDS:**\n"
-        total_count = 0
-        for f, kinds in family_kinds.items():
-            msg += f"- **{f}**: {', '.join(f'`{k}`' for k in kinds)}\n"
-            total_count += len(kinds)
-        msg += f"\n**Total:** {total_count}"
-        await send_ephemeral(interaction, msg)
-
-    @dev.command(name="random", description="Pick a random problem (optionally choose a family)")
-    @slash_admin_only()
-    @app_commands.describe(family="Optional family like arrays_basic")
-    async def dev_random(interaction: discord.Interaction, family: Optional[str] = None):
-        st = load_state()
-        date_str = today_str_ph()
-
-        if family is None:
-            family = random.choice(list(family_kinds.keys()))
-        else:
-            family = family.lower().strip()
-            if family not in family_kinds:
-                families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
-                await send_ephemeral(interaction, f"❌ Invalid family '{family}'. Available:\n{families_list}")
-                return
-
-        kind = random.choice(family_kinds[family])
-        day_index = 0
-        seed = stable_seed_for_day(day_index, date_str)
-        rng = random.Random(seed)
-
-        try:
-            if family == "arrays_basic":
-                p = gen_arrays_basic(rng, kind=kind)
-            elif family == "arrays_nested":
-                p = gen_arrays_nested(rng, kind=kind)
-            elif family == "bool_checks":
-                p = gen_bool_checks(rng, kind=kind)
-            elif family == "functions":
-                p = gen_functions(rng, kind=kind)
-            elif family == "patterns":
-                p = gen_patterns(rng, kind=kind)
-            elif family == "strings":
-                p = gen_strings(rng, kind=kind)
-            elif family == "math_logic":
-                p = gen_math_logic(rng, kind=kind)
-            elif family == "recursion":
-                p = gen_recursion(rng, kind=kind)
-            elif family == "stl_intro":
-                p = gen_stl_intro(rng, kind=kind)
-            else:
-                await send_ephemeral(interaction, "❌ Unexpected error: family not recognized.")
-                return
-        except ValueError as e:
-            await send_ephemeral(interaction, f"❌ {e}")
-            return
-
-        p["day"] = date_str
-        p["seed"] = seed
-        p["day_index"] = day_index
-
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["last_posted_date"] = date_str
-        st["day_index"] = day_index + 1
-        save_state(st)
-
-        await interaction.response.send_message(f"⚙️ **DEV PICK RANDOM:** {family} • {kind}", embed=build_embed(p))
-
-    @dev.command(name="pick", description="Pick a specific family+kind")
-    @slash_admin_only()
-    @app_commands.describe(family="Family (e.g. arrays_basic)", kind="Kind (from /dev list)")
-    async def dev_pick(interaction: discord.Interaction, family: str, kind: str):
-        st = load_state()
-        date_str = today_str_ph()
-        family = family.lower().strip()
-        kind = kind.strip()
-
-        if family not in family_kinds:
-            families_list = ", ".join(f"`{f}`" for f in family_kinds.keys())
-            await send_ephemeral(interaction, f"❌ Invalid family. Available:\n{families_list}")
-            return
-
-        if kind not in family_kinds[family]:
-            kinds_list = ", ".join(f"`{k}`" for k in family_kinds[family])
-            await send_ephemeral(interaction, f"❌ Invalid kind for `{family}`. Available:\n{kinds_list}")
-            return
-
-        day_index = 0
-        seed = stable_seed_for_day(day_index, date_str)
-        rng = random.Random(seed)
-
-        try:
-            if family == "arrays_basic":
-                p = gen_arrays_basic(rng, kind=kind)
-            elif family == "arrays_nested":
-                p = gen_arrays_nested(rng, kind=kind)
-            elif family == "bool_checks":
-                p = gen_bool_checks(rng, kind=kind)
-            elif family == "functions":
-                p = gen_functions(rng, kind=kind)
-            elif family == "patterns":
-                p = gen_patterns(rng, kind=kind)
-            elif family == "strings":
-                p = gen_strings(rng, kind=kind)
-            elif family == "math_logic":
-                p = gen_math_logic(rng, kind=kind)
-            elif family == "recursion":
-                p = gen_recursion(rng, kind=kind)
-            elif family == "stl_intro":
-                p = gen_stl_intro(rng, kind=kind)
-            else:
-                await send_ephemeral(interaction, "❌ Unexpected error: family not recognized.")
-                return
-        except ValueError as e:
-            await send_ephemeral(interaction, f"❌ {e}")
-            return
-
-        p["day"] = date_str
-        p["seed"] = seed
-        p["day_index"] = day_index
-
-        st.setdefault("problems_by_date", {})[date_str] = p
-        st["last_posted_date"] = date_str
-        st["day_index"] = day_index + 1
-        save_state(st)
-
-        await interaction.response.send_message(f"⚙️ **DEV PICK:** {family} • {kind}", embed=build_embed(p))
-
-    tree.add_command(dev)
 
 # =========================
 # PREFIX COMMANDS
 # =========================
 if ENABLE_PREFIX:
+
     @bot.command(name="help")
     async def p_help(ctx: commands.Context):
         await send_public(ctx, help_text())
@@ -1495,13 +1597,13 @@ if ENABLE_PREFIX:
         fam = str(p.get("family", "")).lower()
         steps = ["1) Read input exactly as specified."]
         if fam == "arrays_basic":
-            steps += ["2) Store the n values in `vector<long long> a(n)`.","3) Loop through `a[i]` to compute the required result.","4) Print the result only (no prompts)."]
+            steps += ["2) If required, store values in an array/vector.", "3) Loop to compute the result.", "4) Print result only (no prompts)."]
         elif fam == "arrays_nested":
-            steps += ["2) Store the data (often 2D / multiple values).","3) Use nested loops (`for` inside `for`) to compute.","4) Print result only."]
+            steps += ["2) Store the data.", "3) Use nested loops.", "4) Print result only."]
         elif fam == "functions":
-            steps += ["2) Write a helper function that solves the core task.","3) Call it from `main()` and print the return value."]
+            steps += ["2) Write a helper function.", "3) Call it from `main()` and print result."]
         elif fam == "recursion":
-            steps += ["2) Identify base case.","3) Write recursive step reducing the problem size.","4) Call the recursive function and print the result."]
+            steps += ["2) Identify base case.", "3) Write recursive step.", "4) Call recursive function and print result."]
         else:
             steps += ["2) Use the required topic tools (see `!explain`).", "3) Match output format exactly."]
         await send_public(ctx, "🧩 **Approach (today's problem)**\n" + "\n".join(steps))
@@ -1677,16 +1779,29 @@ if ENABLE_PREFIX:
             logging.exception("postnow error: %s", e)
             await send_public(ctx, f"❌ postnow crashed: `{type(e).__name__}` (check logs)")
 
+
 # =========================
 # READY: SYNC + START TASKS
 # =========================
 @bot.event
 async def on_ready():
     logging.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
-    logging.info("Config: DAILY_CHANNEL_ID=%s SUBMIT_CHANNEL_ID=%s ENABLE_PREFIX=%s ENABLE_SLASH=%s ENFORCE_SKILLS=%s ADMIN_ROLES=%s",
-                 DAILY_CHANNEL_ID, SUBMIT_CHANNEL_ID, ENABLE_PREFIX, ENABLE_SLASH, ENFORCE_SKILLS, ADMIN_ROLES)
-    logging.info("Config: COMPILE_TIMEOUT=%ss RUN_TIMEOUT=%ss MAX_CODE_BYTES=%s COOLDOWN=%ss",
-                 COMPILE_TIMEOUT_SEC, RUN_TIMEOUT_SEC, MAX_CODE_BYTES, SUBMIT_COOLDOWN_SEC)
+    logging.info(
+        "Config: DAILY_CHANNEL_ID=%s SUBMIT_CHANNEL_ID=%s ENABLE_PREFIX=%s ENABLE_SLASH=%s ENFORCE_SKILLS=%s ADMIN_ROLES=%s",
+        DAILY_CHANNEL_ID,
+        SUBMIT_CHANNEL_ID,
+        ENABLE_PREFIX,
+        ENABLE_SLASH,
+        ENFORCE_SKILLS,
+        ADMIN_ROLES,
+    )
+    logging.info(
+        "Config: COMPILE_TIMEOUT=%ss RUN_TIMEOUT=%ss MAX_CODE_BYTES=%s COOLDOWN=%ss",
+        COMPILE_TIMEOUT_SEC,
+        RUN_TIMEOUT_SEC,
+        MAX_CODE_BYTES,
+        SUBMIT_COOLDOWN_SEC,
+    )
     logging.info("Command System: prefix=%r message_content_intent(code)=%s", COMMAND_PREFIX, bot.intents.message_content)
 
     if ENABLE_SLASH:
@@ -1698,6 +1813,7 @@ async def on_ready():
 
     if not post_daily_problem.is_running():
         post_daily_problem.start()
+
 
 # =========================
 # MAIN
